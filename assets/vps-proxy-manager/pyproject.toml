@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vps-proxy-manager"
+version = "0.1.0"
+description = "Telegram controlled manager for authorized VPS sing-box global proxy routing"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Codex generated"}]
+dependencies = [
+  "aiohttp>=3.9.5",
+  "aiosqlite>=0.20.0",
+  "alembic>=1.13.2",
+  "asyncssh>=2.14.2",
+  "cryptography>=42.0.8",
+  "pydantic>=2.8.2",
+  "pydantic-settings>=2.3.4",
+  "python-telegram-bot>=22.0,<23.0",
+  "PyYAML>=6.0.2",
+  "SQLAlchemy>=2.0.31",
+  "structlog>=24.2.0",
+  "typer>=0.12.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.10.1",
+  "pytest>=8.2.2",
+  "pytest-asyncio>=0.23.7",
+  "pytest-cov>=5.0.0",
+  "respx>=0.21.1",
+  "ruff>=0.5.1",
+  "types-PyYAML>=6.0.12",
+]
+
+[project.scripts]
+vps-proxy-manager = "vps_proxy_manager.__main__:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "S", "UP", "ASYNC"]
+ignore = ["S101", "E501", "ASYNC109", "ASYNC240", "S110", "S603", "S607", "UP031"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+warn_return_any = false
+warn_unused_configs = true
+plugins = ["pydantic.mypy"]
+disable_error_code = [
+  "arg-type",
+  "attr-defined",
+  "index",
+  "misc",
+  "no-any-return",
+  "type-arg",
+  "union-attr",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

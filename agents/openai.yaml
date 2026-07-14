@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPS Proxy Telegram"
+  short_description: "Manage authorized VPS proxy routing via Telegram"
+  default_prompt: "Use $vps-proxy-telegram to install and operate the VPS proxy Telegram manager."
