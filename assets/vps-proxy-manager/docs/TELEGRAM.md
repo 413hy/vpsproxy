@@ -38,4 +38,9 @@ Each page shows node name, protocol, status, latency, and current-node marker. N
 
 ## High Risk Confirmation
 
-The bot asks for confirmation before apply, stop, restore, rollback, uninstall, or host credential deletion.
+The bot asks for confirmation before apply, switching back to local exit, re-enabling proxy, rollback, uninstall, or host credential deletion.
+
+## Exit Modes
+
+- `切回本地出口`: persistent direct VPS egress. It disables and stops sing-box.
+- `启用代理`: starts and enables sing-box again with the existing managed config.

@@ -14,6 +14,19 @@ Telegram Bot -> 受控任务 -> SSH 客户端 -> 固定远端 payload action -> 
 
 Telegram 输入必须经过校验，不能拼接成任意 shell。
 
+Codex 的职责是介入控制端生命周期：
+
+- 安装 Skill 和可部署项目
+- 生成/检查配置
+- 初始化数据库
+- 启动/重启 systemd 服务
+- 运行测试和 doctor
+- 分析脱敏日志
+- 修复代码和脚本
+- 通过受控 CLI 或 systemd 做维护动作
+
+Codex 不应该成为 Telegram 运行时每个 VPS 操作的必经 LLM 决策节点。目标 VPS 部署由已审核的确定性任务执行，避免 Telegram 输入触发任意命令。
+
 ## 关键路径
 
 仓库根：
@@ -133,8 +146,8 @@ pytest
 高风险操作必须保留确认：
 
 - 应用全局代理
-- 停止代理
-- 恢复代理
+- 切回本地出口
+- 启用代理
 - 回滚
 - 卸载
 - 删除 VPS/凭据
@@ -202,6 +215,24 @@ SQLAlchemy 数据模型。
 9. 关闭 rollback timer。
 
 不要移除自动回滚保护。
+
+## 本地出口恢复逻辑
+
+用户说“还原/恢复成本地出口/不用代理模式”时，应该使用 Telegram 的 `切回本地出口`，对应远端 action 是 `stop_proxy`。
+
+当前语义：
+
+```text
+stop_proxy    = systemctl disable --now sing-box.service
+restore_proxy = systemctl enable --now sing-box.service
+```
+
+也就是说：
+
+- `stop_proxy` 是持久本地出口，重启后仍不走代理。
+- `restore_proxy` 是重新启用已有代理配置。
+- `rollback` 是回到上一次备份配置，不等同于普通本地出口。
+- `uninstall` 是停用 sing-box 并删除托管配置。
 
 ## 常见故障点
 

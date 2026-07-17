@@ -33,6 +33,7 @@ class TaskStatus(StrEnum):
 
 class TaskKind(StrEnum):
     detect = "detect"
+    status = "status"
     test_ssh = "test_ssh"
     import_subscription = "import_subscription"
     speedtest = "speedtest"

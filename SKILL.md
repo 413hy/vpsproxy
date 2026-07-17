@@ -9,12 +9,15 @@ Use this skill when the user wants Codex to install, configure, update, diagnose
 
 The deployable project is bundled at `assets/vps-proxy-manager/`.
 
+Codex operates the control-plane lifecycle. Runtime Telegram actions must stay deterministic and must not call Codex to generate arbitrary shell from Telegram input.
+
 ## Operating Rules
 
 - Manage only VPS hosts owned by the user or explicitly authorized by the user.
 - Never paste, log, commit, or echo Telegram bot tokens, SSH passwords, private keys, subscription URLs, UUIDs, or full proxy links.
 - Do not generate ad hoc remote shell from Telegram input. Use only the project CLI, fixed Python functions, and audited remote payload commands.
 - For high-risk operations such as applying global proxy routing, rollback, uninstall, credential deletion, and host deletion, require an explicit confirmation in Telegram or from the operator.
+- Treat "restore local exit", "disable proxy", or "不用代理模式" as `stop_proxy`: disable and stop sing-box so the target VPS keeps local egress after reboot.
 - Prefer SSH keys over passwords. If a password is used, explain that it is encrypted at rest but Telegram is not a high-security password vault.
 - For target VPS hosts, prefer Debian/Ubuntu first. Other distros require an adapter extension.
 

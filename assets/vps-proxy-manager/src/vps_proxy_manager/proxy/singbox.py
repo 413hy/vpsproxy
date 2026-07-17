@@ -24,6 +24,10 @@ class ConfigError(ValueError):
 
 
 def node_to_outbound(node: ProxyNodeSpec, tag: str = "proxy") -> dict[str, Any]:
+    if node.params.get("type") == node.protocol and "server_port" in node.params:
+        outbound = dict(node.params)
+        outbound["tag"] = tag
+        return outbound
     if node.protocol == "vless":
         return _vless_outbound(node, tag)
     if node.protocol == "vmess":

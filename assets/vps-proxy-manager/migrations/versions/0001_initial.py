@@ -66,7 +66,7 @@ def upgrade() -> None:
     op.create_table(
         "tasks",
         sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("kind", sa.Enum("detect", "test_ssh", "import_subscription", "speedtest", "apply_proxy", "stop_proxy", "restore_proxy", "rollback", "uninstall", name="taskkind"), nullable=False),
+        sa.Column("kind", sa.Enum("detect", "status", "test_ssh", "import_subscription", "speedtest", "apply_proxy", "stop_proxy", "restore_proxy", "rollback", "uninstall", name="taskkind"), nullable=False),
         sa.Column("status", sa.Enum("queued", "running", "cancel_requested", "succeeded", "failed", "rolled_back", "canceled", name="taskstatus"), nullable=False),
         sa.Column("host_id", sa.Integer(), sa.ForeignKey("vps_hosts.id"), nullable=True),
         sa.Column("actor_user_id", sa.Integer(), nullable=False),

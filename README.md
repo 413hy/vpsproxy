@@ -18,6 +18,21 @@
 
 只允许用于你本人拥有或已获得明确授权管理的 VPS。
 
+## Codex 介入边界
+
+Codex 介入的是控制端项目的部署、配置、测试、升级、诊断和修复。运行时 Telegram Bot 不会把用户消息交给 Codex 临时生成 shell，也不会让 Telegram 输入拼接成任意命令。
+
+设计边界是：
+
+```text
+Codex：安装/升级/诊断/修复控制端项目，必要时运行受控 CLI
+Telegram Bot：收集参数、展示菜单、创建受控任务
+后端任务：按固定函数 SSH 到目标 VPS
+目标 VPS：只执行固定 payload action，例如 detect/status/speedtest/apply_proxy/stop_proxy/rollback
+```
+
+这样保留了 Codex 的运维介入能力，同时避免把生产运行架构变成“聊天消息驱动任意命令执行”。
+
 ## 仓库结构
 
 ```text
@@ -130,6 +145,29 @@ sudo journalctl -u vps-proxy-manager.service -f
 8. 确认节点可用后选择 `选择并应用到 VPS`。
 9. 高风险操作会二次确认。
 10. 在 `当前状态` 中查看目标 VPS 当前代理状态。
+
+## 出口模式
+
+系统里有两个明确模式：
+
+- 代理出口：目标 VPS 的主要出站流量通过当前选中节点。
+- 本地出口：目标 VPS 不走代理，恢复为 VPS 原本的本地公网出口。
+
+Telegram 里的 `切回本地出口` 会在目标 VPS 上执行：
+
+```bash
+systemctl disable --now sing-box.service
+```
+
+因此它是持久化的：目标 VPS 重启后也不会自动重新走代理。
+
+Telegram 里的 `启用代理` 会重新执行：
+
+```bash
+systemctl enable --now sing-box.service
+```
+
+也就是恢复之前已经写入的 sing-box 配置。
 
 ## 支持的代理输入
 

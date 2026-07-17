@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from tests.test_parser import VLESS_REALITY
 from vps_proxy_manager.proxy.parser import parse_node_link
 from vps_proxy_manager.proxy.singbox import (
@@ -33,3 +35,24 @@ def test_speedtest_config_uses_mixed_local_inbound() -> None:
     inbound = config["inbounds"][0]
     assert inbound["type"] == "mixed"
     assert inbound["listen"] == "127.0.0.1"
+
+
+def test_singbox_native_outbound_is_preserved() -> None:
+    node = parse_node_link(VLESS_REALITY)
+    native = {
+        "type": "vless",
+        "tag": "original",
+        "server": node.server,
+        "server_port": node.port,
+        "uuid": node.params["uuid"],
+        "tls": {
+            "enabled": True,
+            "server_name": "apple.com",
+            "reality": {"enabled": True, "public_key": "abc", "short_id": "1"},
+        },
+    }
+    from vps_proxy_manager.proxy.parser import parse_node_blob
+
+    preserved = node_to_outbound(parse_node_blob(json.dumps(native)), "proxy")
+    assert preserved["tag"] == "proxy"
+    assert preserved["tls"]["reality"]["enabled"] is True

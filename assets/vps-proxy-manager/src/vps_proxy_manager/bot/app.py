@@ -42,7 +42,18 @@ from vps_proxy_manager.utils.validators import (
     validate_username,
 )
 
-ADD_NAME, ADD_HOST, ADD_PORT, ADD_USER, ADD_AUTH, ADD_SECRET, IMPORT_NODE, IMPORT_SUB_NAME, IMPORT_SUB_URL = range(9)
+(
+    ADD_NAME,
+    ADD_HOST,
+    ADD_PORT,
+    ADD_USER,
+    ADD_AUTH,
+    ADD_SECRET,
+    ADD_CONFIRM,
+    IMPORT_NODE,
+    IMPORT_SUB_NAME,
+    IMPORT_SUB_URL,
+) = range(10)
 
 
 @dataclass
@@ -67,6 +78,7 @@ def build_application(deps: BotDeps) -> Application:
             ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_host_user)],
             ADD_AUTH: [CallbackQueryHandler(add_host_auth, pattern="^auth:(password|private_key)$")],
             ADD_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_host_secret)],
+            ADD_CONFIRM: [CallbackQueryHandler(add_host_confirm, pattern="^save_host:(yes|no)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
@@ -163,6 +175,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif data.startswith("speedtest:"):
         _, host_id, _scope = data.split(":")
         await enqueue_task(update, context, TaskKind.speedtest, int(host_id), {})
+    elif data == "status_menu":
+        await choose_host_for_status(update, context)
+    elif data == "speedtest_menu":
+        await choose_host_for_speed_all(update, context)
     elif data == "tasks":
         await show_tasks(update, context)
     elif data in {"help", "security"}:
@@ -186,8 +202,16 @@ async def show_host(update: Update, context: ContextTypes.DEFAULT_TYPE, host_id:
         repo = Repository(session, deps(context).secret_box)
         host = await repo.get_host(host_id)
         sysinfo = host.system_info.get("os_release", {})
-        node = host.current_node.name if host.current_node else "未选择"
-        text = f"{host.name}\n地址：{host.host}:{host.port}\n系统：{sysinfo.get('PRETTY_NAME', '未知')}\n当前节点：{node}"
+        node_name = "未选择"
+        if host.current_node_id:
+            node_name = (await repo.get_node(host.current_node_id)).name
+        exit_mode = host.last_status.get("exit_mode") or "未知"
+        service = host.last_status.get("singbox_active") or "未知"
+        text = (
+            f"{host.name}\n地址：{host.host}:{host.port}\n"
+            f"系统：{sysinfo.get('PRETTY_NAME', '未知')}\n"
+            f"当前节点：{node_name}\n出口模式：{exit_mode}\nsing-box：{service}"
+        )
     await update.callback_query.edit_message_text(text, reply_markup=host_detail(host))
 
 
@@ -221,6 +245,33 @@ async def choose_host_for_speed(update: Update, context: ContextTypes.DEFAULT_TY
         repo = Repository(session, deps(context).secret_box)
         hosts = await repo.list_hosts()
     await update.callback_query.edit_message_text("选择从哪台 VPS 发起测速", reply_markup=choose_host(hosts, "speed_node", node_id))
+
+
+async def choose_host_for_speed_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with deps(context).session_factory() as session:
+        repo = Repository(session, deps(context).secret_box)
+        hosts = await repo.list_hosts()
+    rows = [
+        [InlineKeyboardButton(host.name, callback_data=f"speedtest:{host.id}:all")]
+        for host in hosts
+    ]
+    rows.append([InlineKeyboardButton("返回", callback_data="main")])
+    await update.callback_query.edit_message_text(
+        "选择从哪台 VPS 测试所有节点",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def choose_host_for_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with deps(context).session_factory() as session:
+        repo = Repository(session, deps(context).secret_box)
+        hosts = await repo.list_hosts()
+    rows = [[InlineKeyboardButton(host.name, callback_data=f"task:status:{host.id}")] for host in hosts]
+    rows.append([InlineKeyboardButton("返回", callback_data="main")])
+    await update.callback_query.edit_message_text(
+        "选择要查看状态的 VPS",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def enqueue_task(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: TaskKind, host_id: int | None, payload: dict[str, Any]) -> None:
@@ -318,6 +369,36 @@ async def add_host_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except SSHError as exc:
         await update.effective_chat.send_message(f"SSH 测试失败：{exc}")
         return ConversationHandler.END
+    pretty = system.get("os_release", {}).get("PRETTY_NAME", "未知系统")
+    data["secret"] = secret
+    data["known_host"] = known_host
+    data["system"] = system
+    fingerprint_hint = known_host.splitlines()[0][:72] if known_host else "未捕获"
+    await update.effective_chat.send_message(
+        (
+            f"SSH 测试成功，检测到：{pretty}\n"
+            f"主机指纹记录：{fingerprint_hint}...\n\n"
+            "确认保存这台 VPS？"
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("确认保存", callback_data="save_host:yes"),
+                    InlineKeyboardButton("取消", callback_data="save_host:no"),
+                ]
+            ]
+        ),
+    )
+    return ADD_CONFIRM
+
+
+async def add_host_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.callback_query.answer()
+    if update.callback_query.data == "save_host:no":
+        context.user_data.pop("add_host", None)
+        await update.callback_query.edit_message_text("已取消保存。", reply_markup=main_menu())
+        return ConversationHandler.END
+    data = context.user_data["add_host"]
     async with deps(context).session_factory() as session:
         repo = Repository(session, deps(context).secret_box)
         host = await repo.add_host(
@@ -325,15 +406,23 @@ async def add_host_secret(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             host=data["host"],
             port=data["port"],
             username=data["username"],
-            auth_method=auth,
-            secret=secret,
-            known_host=known_host,
-            system_info=system,
+            auth_method=AuthMethod(data["auth_method"]),
+            secret=data["secret"],
+            known_host=data["known_host"],
+            system_info=data["system"],
         )
-        await repo.audit(actor_user_id=update.effective_user.id, action="add_host", result="ok", host_id=host.id)
+        await repo.audit(
+            actor_user_id=update.effective_user.id,
+            action="add_host",
+            result="ok",
+            host_id=host.id,
+        )
         await session.commit()
-    pretty = system.get("os_release", {}).get("PRETTY_NAME", "未知系统")
-    await update.effective_chat.send_message(f"已保存 VPS：{data['name']}\n检测到：{pretty}", reply_markup=main_menu())
+    context.user_data.pop("add_host", None)
+    await update.callback_query.edit_message_text(
+        f"已保存 VPS：{data['name']}",
+        reply_markup=main_menu(),
+    )
     return ConversationHandler.END
 
 
@@ -407,5 +496,7 @@ async def import_sub_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("add_host", None)
+    context.user_data.pop("import_sub", None)
     await update.effective_message.reply_text("已取消。", reply_markup=main_menu())
     return ConversationHandler.END

@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 
-from vps_proxy_manager.proxy.parser import parse_node_link, parse_subscription_text
+from vps_proxy_manager.proxy.parser import parse_node_blob, parse_node_link, parse_subscription_text
 
 VLESS_REALITY = (
     "vless://5d80eab0-0345-46db-a106-ff59f56d70e4@193.218.200.147:29630"
@@ -50,6 +50,9 @@ proxies:
     nodes = parse_subscription_text(text)
     assert nodes[0].name == "clash-vless"
     assert nodes[0].server == "example.com"
+    stored = parse_node_blob(nodes[0].link)
+    assert stored.name == "clash-vless"
+    assert stored.params["uuid"] == "11111111-1111-4111-8111-111111111111"
 
 
 def test_singbox_json_subscription() -> None:
@@ -68,3 +71,12 @@ def test_singbox_json_subscription() -> None:
     )
     nodes = parse_subscription_text(text)
     assert nodes[0].name == "sb-vless"
+    stored = parse_node_blob(nodes[0].link)
+    assert stored.server == "example.org"
+
+
+def test_parse_trojan_link_password() -> None:
+    node = parse_node_link("trojan://secret@example.com:443?sni=example.com#trojan")
+    assert node.protocol == "trojan"
+    assert node.params["password"] == "secret"  # noqa: S105
+    assert node.params["sni"] == "example.com"

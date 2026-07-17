@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from vps_proxy_manager.config import Settings
 from vps_proxy_manager.crypto import SecretBox
 from vps_proxy_manager.models import ProxyNode, Task, TaskKind, TaskStatus
-from vps_proxy_manager.proxy.parser import parse_node_link
+from vps_proxy_manager.proxy.parser import ProxyNodeSpec, parse_node_blob
 from vps_proxy_manager.proxy.singbox import build_speedtest_config, build_tun_config
 from vps_proxy_manager.services.repository import Repository
 from vps_proxy_manager.ssh.client import SSHClient, SSHError, credentials_from_host
@@ -97,9 +97,10 @@ class TaskRunner:
         handlers: dict[TaskKind, Callable[[AsyncSession, Task], Awaitable[None]]] = {
             TaskKind.detect: self._detect,
             TaskKind.test_ssh: self._detect,
+            TaskKind.status: self._status,
             TaskKind.speedtest: self._speedtest,
             TaskKind.apply_proxy: self._apply_proxy,
-            TaskKind.stop_proxy: self._simple_remote("stop_proxy", "代理已停止"),
+            TaskKind.stop_proxy: self._simple_remote("stop_proxy", "已切回 VPS 本地出口"),
             TaskKind.restore_proxy: self._simple_remote("restore_proxy", "代理已恢复"),
             TaskKind.rollback: self._simple_remote("rollback", "已回滚上一配置"),
             TaskKind.uninstall: self._simple_remote("uninstall", "已卸载并保留备份"),
@@ -122,12 +123,32 @@ class TaskRunner:
         await repo.audit(actor_user_id=task.actor_user_id, action=task.kind.value, result="ok", host_id=host.id)
         await self._finish(session, task, TaskStatus.succeeded, None, "检测完成", result)
 
+    async def _status(self, session: AsyncSession, task: Task) -> None:
+        repo = Repository(session, self.secret_box)
+        host = await repo.get_host(task.host_id or 0)
+        creds = credentials_from_host(host, repo.decrypt_host_secret(host))
+        result = await self.ssh.run_payload(creds, "status", {}, timeout=45)
+        status = result.get("status", {})
+        if isinstance(status, dict):
+            service = status.get("singbox_active")
+            status["exit_mode"] = "proxy" if service == "active" else "local"
+            host.last_status = status
+        await repo.audit(actor_user_id=task.actor_user_id, action="status", result="ok", host_id=host.id)
+        await self._finish(session, task, TaskStatus.succeeded, None, "状态已刷新", result)
+
     def _simple_remote(self, action: str, message: str) -> Callable[[AsyncSession, Task], Awaitable[None]]:
         async def handler(session: AsyncSession, task: Task) -> None:
             repo = Repository(session, self.secret_box)
             host = await repo.get_host(task.host_id or 0)
             creds = credentials_from_host(host, repo.decrypt_host_secret(host))
             result = await self.ssh.run_payload(creds, action, {}, timeout=180)
+            if action == "stop_proxy":
+                host.last_status = {"singbox_active": "inactive", "exit_mode": "local"}
+            elif action == "restore_proxy":
+                host.last_status = {"singbox_active": "active", "exit_mode": "proxy"}
+            elif action in {"rollback", "uninstall"}:
+                host.current_node_id = None
+                host.last_status = {"singbox_active": "inactive", "exit_mode": "local"}
             await repo.audit(actor_user_id=task.actor_user_id, action=action, result="ok", host_id=host.id)
             await self._finish(session, task, TaskStatus.succeeded, None, message, result)
 
@@ -142,25 +163,41 @@ class TaskRunner:
         if not node_ids:
             raise ValueError("no nodes available")
         creds = credentials_from_host(host, repo.decrypt_host_secret(host))
-        results: list[dict[str, Any]] = []
+        test_items: list[tuple[int, ProxyNodeSpec, int]] = []
+        for idx, node_id in enumerate(node_ids):
+            node = await repo.get_node(int(node_id))
+            spec = parse_node_blob(repo.decrypt_node_link(node))
+            test_items.append((int(node_id), spec, 18080 + idx))
         sem = asyncio.Semaphore(self.settings.speedtest_concurrency)
 
-        async def test_one(node_id: int, index: int) -> None:
+        async def test_one(node_id: int, spec: ProxyNodeSpec, listen_port: int) -> dict[str, Any]:
             async with sem:
-                node = await repo.get_node(node_id)
-                spec = parse_node_link(repo.decrypt_node_link(node))
-                config = build_speedtest_config(spec, 18080 + index)
-                result = await self.ssh.run_payload(
-                    creds,
-                    "speedtest",
-                    {"config": config, "listen_port": 18080 + index},
-                    timeout=90,
-                )
-                test = result.get("result", {})
-                await repo.update_node_test(node, test)
-                results.append({"node_id": node_id, **test})
+                try:
+                    config = build_speedtest_config(spec, listen_port)
+                    result = await self.ssh.run_payload(
+                        creds,
+                        "speedtest",
+                        {"config": config, "listen_port": listen_port},
+                        timeout=90,
+                    )
+                    test = result.get("result", {})
+                    return {"node_id": node_id, **test}
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        "node_id": node_id,
+                        "dns_ok": False,
+                        "tcp_ok": False,
+                        "proxy_ok": False,
+                        "latency_ms": None,
+                        "error": str(exc),
+                    }
 
-        await asyncio.gather(*(test_one(int(node_id), idx) for idx, node_id in enumerate(node_ids)))
+        results = await asyncio.gather(
+            *(test_one(node_id, spec, port) for node_id, spec, port in test_items)
+        )
+        for result in results:
+            node = await repo.get_node(int(result["node_id"]))
+            await repo.update_node_test(node, result)
         await repo.audit(actor_user_id=task.actor_user_id, action="speedtest", result="ok", host_id=host.id)
         await self._finish(session, task, TaskStatus.succeeded, None, "测速完成", {"results": results})
 
@@ -168,7 +205,7 @@ class TaskRunner:
         repo = Repository(session, self.secret_box)
         host = await repo.get_host(task.host_id or 0)
         node = await repo.get_node(int(task.payload["node_id"]))
-        spec = parse_node_link(repo.decrypt_node_link(node))
+        spec = parse_node_blob(repo.decrypt_node_link(node))
         ssh_client_ip = (host.system_info or {}).get("ssh_client_ip")
         config = build_tun_config(
             spec,

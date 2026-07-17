@@ -2,7 +2,7 @@
 
 ## Roles
 
-- Codex Skill: installs, configures, updates, diagnoses, and calls deterministic project commands.
+- Codex Skill: installs, configures, updates, diagnoses, tests, and calls deterministic project commands on the control VPS.
 - Telegram Bot: collects inputs, displays menus/status, and creates predefined tasks.
 - Backend task runner: performs SSH, detection, subscription import, speed tests, proxy apply, rollback, and audit logging.
 - Target payload: fixed Python actions executed over SSH. It does not receive arbitrary shell.
@@ -33,3 +33,23 @@
 `queued`, `running`, `cancel_requested`, `succeeded`, `failed`, `rolled_back`, `canceled`.
 
 Long-running tasks do not block the Telegram polling loop.
+
+## Codex Boundary
+
+Codex is deliberately not called by the Telegram bot for each runtime operation. The bot creates predefined tasks and the backend executes audited code paths. Codex remains the operator for deployment, diagnosis, upgrades, test runs, and code/script repair.
+
+This avoids a production pattern where Telegram text causes an LLM to generate arbitrary shell commands.
+
+## Local Exit Mode
+
+`stop_proxy` means persistent local VPS egress:
+
+```text
+systemctl disable --now sing-box.service
+```
+
+`restore_proxy` means re-enable the existing proxy config:
+
+```text
+systemctl enable --now sing-box.service
+```

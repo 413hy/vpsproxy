@@ -28,9 +28,9 @@ def host_list(hosts: Sequence[VpsHost]) -> InlineKeyboardMarkup:
 def host_detail(host: VpsHost) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("测试 SSH", callback_data=f"task:test_ssh:{host.id}"), InlineKeyboardButton("当前状态", callback_data=f"task:detect:{host.id}")],
+            [InlineKeyboardButton("测试 SSH", callback_data=f"task:test_ssh:{host.id}"), InlineKeyboardButton("刷新状态", callback_data=f"task:status:{host.id}")],
             [InlineKeyboardButton("测试所有节点", callback_data=f"speedtest:{host.id}:all")],
-            [InlineKeyboardButton("停止代理", callback_data=f"confirm:stop_proxy:{host.id}:0"), InlineKeyboardButton("恢复代理", callback_data=f"confirm:restore_proxy:{host.id}:0")],
+            [InlineKeyboardButton("切回本地出口", callback_data=f"confirm:stop_proxy:{host.id}:0"), InlineKeyboardButton("启用代理", callback_data=f"confirm:restore_proxy:{host.id}:0")],
             [InlineKeyboardButton("回滚配置", callback_data=f"confirm:rollback:{host.id}:0"), InlineKeyboardButton("彻底卸载", callback_data=f"confirm:uninstall:{host.id}:0")],
             [InlineKeyboardButton("返回", callback_data="hosts")],
         ]

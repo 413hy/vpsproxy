@@ -209,15 +209,16 @@ def rollback() -> None:
 
 
 def stop_proxy() -> None:
-    run(["systemctl", "stop", "sing-box.service"], check=False)
-    ok({"stopped": True})
+    disarm_rollback()
+    run(["systemctl", "disable", "--now", "sing-box.service"], check=False)
+    ok({"stopped": True, "exit_mode": "local", "persistent": True})
 
 
 def restore_proxy() -> None:
-    result = run(["systemctl", "start", "sing-box.service"], check=False)
+    result = run(["systemctl", "enable", "--now", "sing-box.service"], check=False)
     if result.returncode != 0:
         fail("restore_failed", "代理服务恢复失败", result.stderr[-1200:])
-    ok({"running": True})
+    ok({"running": True, "exit_mode": "proxy", "persistent": True})
 
 
 def uninstall() -> None:
