@@ -19,9 +19,11 @@ rsync -a --delete \
   --exclude '*.egg-info/' \
   "$SRC_DIR/" "$APP_DIR/"
 "$APP_DIR/venv/bin/pip" install --upgrade -e "$APP_DIR"
-mkdir -p /root/.codex/skills/vps-proxy-target-bootstrap
-rsync -a --delete "$APP_DIR/codex-skills/vps-proxy-target-bootstrap/" /root/.codex/skills/vps-proxy-target-bootstrap/
-chmod -R go-rwx /root/.codex/skills/vps-proxy-target-bootstrap
+for skill in vps-proxy-target-bootstrap vps-proxy-task-diagnosis; do
+  mkdir -p "/root/.codex/skills/$skill"
+  rsync -a --delete "$APP_DIR/codex-skills/$skill/" "/root/.codex/skills/$skill/"
+  chmod -R go-rwx "/root/.codex/skills/$skill"
+done
 "$APP_DIR/venv/bin/vps-proxy-manager" init-db
 chown -R root:root "$APP_DIR"
 cp "$APP_DIR/systemd/vps-proxy-manager.service" /etc/systemd/system/vps-proxy-manager.service

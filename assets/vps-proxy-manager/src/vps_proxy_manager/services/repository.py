@@ -592,7 +592,23 @@ class Repository:
         ).all()
 
     async def create_codex_task(self, candidate_id: int) -> CodexTask:
-        task = CodexTask(candidate_id=candidate_id)
+        task = CodexTask(candidate_id=candidate_id, operation="provision")
+        self.session.add(task)
+        await self.session.flush()
+        return task
+
+    async def create_codex_diagnostic(self, source_task_id: int) -> CodexTask:
+        existing = await self.session.scalar(
+            select(CodexTask).where(CodexTask.source_task_id == source_task_id)
+        )
+        if existing is not None:
+            return existing
+        task = CodexTask(
+            candidate_id=None,
+            source_task_id=source_task_id,
+            operation="diagnose",
+            message="任务失败，等待 Codex 自动诊断",
+        )
         self.session.add(task)
         await self.session.flush()
         return task

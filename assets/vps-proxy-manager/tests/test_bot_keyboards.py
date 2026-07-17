@@ -8,6 +8,7 @@ from vps_proxy_manager.bot.keyboards import (
     main_reply_keyboard,
     risk_confirm,
     subscription_entries,
+    task_detail,
 )
 
 
@@ -49,3 +50,19 @@ def test_subscription_entry_controls_stay_within_callback_limit() -> None:
     ]
     assert callbacks
     assert all(len(value.encode("utf-8")) <= 64 for value in callbacks)
+
+
+def test_finished_task_links_results_and_codex_diagnosis() -> None:
+    markup = task_detail(
+        9,
+        False,
+        result_callback="vse:list:7:0",
+        codex_task_id=11,
+    )
+    callbacks = {
+        button.callback_data
+        for row in markup.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert {"vse:list:7:0", "ct:v:11", "t:v:9"} <= callbacks

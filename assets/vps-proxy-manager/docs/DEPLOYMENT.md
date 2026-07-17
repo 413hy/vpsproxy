@@ -51,6 +51,8 @@ VPSPM_SECRET_KEY=实际Fernet密钥
 VPSPM_CODEX_ENABLED=true
 VPSPM_CODEX_CLI=/usr/local/bin/codex
 VPSPM_CODEX_HOME=/root/.codex
+VPSPM_CODEX_MODEL=gpt-5.6-sol
+VPSPM_CODEX_REASONING_EFFORT=xhigh
 ```
 
 不要将实际文件复制到仓库。

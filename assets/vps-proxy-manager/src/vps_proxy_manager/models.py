@@ -352,8 +352,11 @@ class CodexTask(Base):
     __tablename__ = "codex_tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    candidate_id: Mapped[int] = mapped_column(
-        ForeignKey("vps_candidates.id", ondelete="CASCADE"), index=True
+    candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vps_candidates.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    source_task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tasks.id", ondelete="CASCADE"), nullable=True, unique=True, index=True
     )
     operation: Mapped[str] = mapped_column(String(40), default="provision")
     status: Mapped[CodexTaskStatus] = mapped_column(

@@ -51,10 +51,10 @@ VPSPM_SECRET_KEY=keygen生成的值
 
 ```text
 vps-proxy-manager.service          Bot 与普通任务执行器
-vps-proxy-codex-worker.service    候选 VPS 的 Codex 初始化准入
+vps-proxy-codex-worker.service    候选 VPS 准入和失败任务自动诊断
 ```
 
-两个服务均按当前部署要求以 root 运行。Bot 不会调用 Codex 处理普通测速、切换或删除动作；这些动作由固定任务处理器执行。Codex Worker 只处理候选 VPS 初始化，提示词只有数据库整数 ID。
+两个服务均按当前部署要求以 root 运行。普通测速、切换和删除仍由固定任务处理器执行；任务发生系统级失败时，Worker 会自动让 Codex 只读分析脱敏上下文并主动发送 Telegram 诊断结果。Codex 不会自动重放网络修改任务。
 
 ## 第一次使用
 
@@ -63,6 +63,10 @@ vps-proxy-codex-worker.service    候选 VPS 的 Codex 初始化准入
 3. 输入名称、地址、端口、用户名，选择密码或私钥。
 4. 核对 Bot 展示的 SSH SHA256 主机指纹。
 5. 确认后等待 Codex 准入任务；失败时在待初始化列表查看原因并手动重试。
+
+测速完成后，任务消息中的 `查看各节点测速结果` 会跳到对应列表。节点详情分别显示 DNS、TCP、代理握手、真实访问延迟和失败原因。
+
+后台任务失败时无需主动请求排查：系统自动创建 `diagnose` Codex 任务，使用 `VPSPM_CODEX_MODEL` 和 `VPSPM_CODEX_REASONING_EFFORT`，完成后主动通知管理员并在任务中心保留结构化结论。
 6. 在 `单节点库` 或 `订阅库` 导入资源。
 7. 在控制端测速后，将资源导入一台或多台 VPS。
 8. 进入指定 VPS 的单节点/订阅页，从目标本机测速。

@@ -638,12 +638,7 @@ async def show_nodes(
 async def show_node(update: Update, context: ContextTypes.DEFAULT_TYPE, node_id: int) -> None:
     async with deps(context).session_factory() as session:
         node = await Repository(session, deps(context).secret_box).get_node(node_id)
-    result = node.last_test or {}
-    text = (
-        f"{node.name}\n\n协议：{node.protocol}\n服务器：{mask(node.server)}:{node.port}\n"
-        f"状态：{node.status.value}\nTCP：{_ms(result.get('tcp_latency_ms'))}\n"
-        f"代理握手：{_ms(result.get('proxy_handshake_ms'))}\n真实访问：{_ms(result.get('access_latency_ms'))}"
-    )
+    text = f"{node.name}\n\n协议：{node.protocol}\n服务器：{mask(node.server)}:{node.port}\n{_test_result_text(node)}"
     await _edit(update, text, node_detail(node))
 
 
@@ -811,15 +806,10 @@ async def show_subscription_entry(
 ) -> None:
     async with deps(context).session_factory() as session:
         item = await Repository(session, deps(context).secret_box).get_subscription_entry(entry_id)
-    result = item.last_test or {}
     markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("返回订阅节点", callback_data=f"se:list:{item.subscription_id}:0")]]
     )
-    text = (
-        f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n"
-        f"TCP：{_ms(result.get('tcp_latency_ms'))}\n代理握手：{_ms(result.get('proxy_handshake_ms'))}\n"
-        f"真实访问：{_ms(result.get('access_latency_ms'))}"
-    )
+    text = f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n{_test_result_text(item)}"
     await _edit(update, text, markup)
 
 
@@ -990,12 +980,7 @@ async def show_vps_nodes(
 async def show_vps_node(update: Update, context: ContextTypes.DEFAULT_TYPE, item_id: int) -> None:
     async with deps(context).session_factory() as session:
         item = await Repository(session, deps(context).secret_box).get_vps_node(item_id)
-    result = item.last_test or {}
-    text = (
-        f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n"
-        f"TCP：{_ms(result.get('tcp_latency_ms'))}\n代理握手：{_ms(result.get('proxy_handshake_ms'))}\n"
-        f"真实访问：{_ms(result.get('access_latency_ms'))}"
-    )
+    text = f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n{_test_result_text(item)}"
     await _edit(update, text, vps_node_detail(item))
 
 
@@ -1052,12 +1037,7 @@ async def show_vps_subscription_entry(
         repo = Repository(session, deps(context).secret_box)
         item = await repo.get_vps_subscription_entry(entry_id)
         sub = await repo.get_vps_subscription(item.vps_subscription_id)
-    result = item.last_test or {}
-    text = (
-        f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n"
-        f"TCP：{_ms(result.get('tcp_latency_ms'))}\n代理握手：{_ms(result.get('proxy_handshake_ms'))}\n"
-        f"真实访问：{_ms(result.get('access_latency_ms'))}"
-    )
+    text = f"{item.name}\n\n协议：{item.protocol}\n服务器：{mask(item.server)}:{item.port}\n{_test_result_text(item)}"
     await _edit(update, text, vps_subscription_entry_detail(item, sub.host_id))
 
 
@@ -1251,7 +1231,16 @@ async def show_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
         if item is None:
             raise KeyError("task not found")
     active = item.status in {TaskStatus.queued, TaskStatus.running, TaskStatus.cancel_requested}
-    await _edit(update, _task_text(item), task_detail(item.id, active))
+    await _edit(
+        update,
+        _task_text(item),
+        task_detail(
+            item.id,
+            active,
+            result_callback=_task_result_callback(item),
+            codex_task_id=_task_codex_id(item),
+        ),
+    )
 
 
 async def show_codex_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> None:
@@ -1261,9 +1250,24 @@ async def show_codex_task(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
         f"Codex 任务 #{item.id}\n操作：{item.operation}\n状态：{item.status.value}\n"
         f"进度：{item.progress}%\n结果：{item.message}"
     )
-    await _edit(
-        update, text, InlineKeyboardMarkup([[InlineKeyboardButton("返回", callback_data="t:list")]])
-    )
+    diagnosis = item.result.get("diagnosis") if isinstance(item.result, dict) else None
+    if isinstance(diagnosis, dict):
+        evidence = "\n".join(f"• {value}" for value in diagnosis.get("evidence", [])[:5])
+        actions = "\n".join(f"• {value}" for value in diagnosis.get("recommended_actions", [])[:5])
+        text += (
+            f"\n\n严重程度：{diagnosis.get('severity', 'unknown')}"
+            f"\n根因：{diagnosis.get('root_cause', '未提供')}"
+            f"\n可安全重试：{'是' if diagnosis.get('retry_safe') else '否'}"
+            + (f"\n\n证据：\n{evidence}" if evidence else "")
+            + (f"\n\n建议：\n{actions}" if actions else "")
+        )
+    rows = []
+    if item.source_task_id:
+        rows.append(
+            [InlineKeyboardButton("查看原任务", callback_data=f"t:v:{item.source_task_id}")]
+        )
+    rows.append([InlineKeyboardButton("返回", callback_data="t:list")])
+    await _edit(update, text[:4000], InlineKeyboardMarkup(rows))
 
 
 async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> None:
@@ -1753,7 +1757,12 @@ async def _monitor_task(
                     text,
                     chat_id=chat_id,
                     message_id=message_id,
-                    reply_markup=task_detail(task_id, active),
+                    reply_markup=task_detail(
+                        task_id,
+                        active,
+                        result_callback=_task_result_callback(task),
+                        codex_task_id=_task_codex_id(task),
+                    ),
                 )
             except BadRequest as exc:
                 if "Message is not modified" not in str(exc):
@@ -1889,6 +1898,41 @@ def _task_text(task: Task) -> str:
         f"任务 #{task.id}\n类型：{task.kind.value}\n状态：{task.status.value}\n"
         f"进度：{task.progress}%\n结果：{task.message}"
         + (f"\n错误代码：{task.error_code}" if task.error_code else "")
+    )
+
+
+def _task_result_callback(task: Task) -> str | None:
+    if task.status != TaskStatus.succeeded:
+        return None
+    if task.kind == TaskKind.local_node_test:
+        return "n:list:0"
+    if task.kind == TaskKind.local_subscription_test and task.payload.get("subscription_id"):
+        return f"se:list:{int(task.payload['subscription_id'])}:0"
+    if task.kind == TaskKind.vps_node_test and task.host_id:
+        return f"vh:n:{task.host_id}:0"
+    if task.kind == TaskKind.vps_subscription_test and task.payload.get("vps_subscription_id"):
+        return f"vse:list:{int(task.payload['vps_subscription_id'])}:0"
+    return None
+
+
+def _task_codex_id(task: Task) -> int | None:
+    value = (task.result or {}).get("codex_diagnostic_task_id")
+    return int(value) if isinstance(value, int | str) and str(value).isdigit() else None
+
+
+def _test_result_text(item: Any) -> str:
+    result = item.last_test or {}
+    error = redact_text(str(result.get("error") or ""))[:500]
+    dns = "成功" if result.get("dns_ok") else "失败"
+    tcp = "成功" if result.get("tcp_ok") else "失败"
+    proxy = "成功" if result.get("proxy_ok") else "失败"
+    return (
+        f"状态：{item.status.value}\n"
+        f"DNS：{dns} · {_ms(result.get('dns_latency_ms'))}\n"
+        f"TCP：{tcp} · {_ms(result.get('tcp_latency_ms'))}\n"
+        f"代理握手：{proxy} · {_ms(result.get('proxy_handshake_ms'))}\n"
+        f"真实访问：{_ms(result.get('access_latency_ms'))}"
+        + (f"\n失败原因：{error}" if error else "")
     )
 
 

@@ -68,9 +68,11 @@ chmod 700 "$APP_DIR/data"
 chown root:root "$ENV_DIR" "$ENV_DIR/vps-proxy-manager.env"
 chmod 700 "$ENV_DIR"
 chmod 600 "$ENV_DIR/vps-proxy-manager.env"
-mkdir -p /root/.codex/skills/vps-proxy-target-bootstrap
-rsync -a --delete "$APP_DIR/codex-skills/vps-proxy-target-bootstrap/" /root/.codex/skills/vps-proxy-target-bootstrap/
-chmod -R go-rwx /root/.codex/skills/vps-proxy-target-bootstrap
+for skill in vps-proxy-target-bootstrap vps-proxy-task-diagnosis; do
+  mkdir -p "/root/.codex/skills/$skill"
+  rsync -a --delete "$APP_DIR/codex-skills/$skill/" "/root/.codex/skills/$skill/"
+  chmod -R go-rwx "/root/.codex/skills/$skill"
+done
 "$APP_DIR/venv/bin/vps-proxy-manager" init-db
 cp "$APP_DIR/systemd/vps-proxy-manager.service" /etc/systemd/system/vps-proxy-manager.service
 cp "$APP_DIR/systemd/vps-proxy-codex-worker.service" /etc/systemd/system/vps-proxy-codex-worker.service

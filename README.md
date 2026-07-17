@@ -11,7 +11,7 @@
 | 控制端单节点库 | 只保存手工导入的单节点，在控制端本地测速 |
 | 控制端订阅库 | 保存完整订阅及其独立缓存条目，在控制端本地更新和测速；条目不会进入单节点库 |
 | 每台目标 VPS | 保存导入到该 VPS 的单节点/订阅副本，并从该 VPS 发起测速；任一时刻只允许一个代理出站 |
-| Codex Worker | 仅对待准入 VPS 执行受控初始化和验收；不把 Telegram 文本转换成任意 Shell |
+| Codex Worker | 对待准入 VPS 执行受控初始化，并自动只读诊断失败任务；不把 Telegram 文本转换成任意 Shell |
 
 新 VPS 的流程是：Telegram 收集连接参数并确认 SSH 主机指纹，创建候选记录，Codex Worker 调用内置 `$vps-proxy-target-bootstrap` Skill，Skill 再调用固定 CLI。只有远端 Agent、TUN、sing-box、本地出口和 SSH 验证全部通过后，VPS 才进入正式管理库。
 
@@ -37,6 +37,7 @@
 ├── agents/openai.yaml
 └── assets/vps-proxy-manager/
     ├── codex-skills/vps-proxy-target-bootstrap/  # Codex 准入子 Skill
+    ├── codex-skills/vps-proxy-task-diagnosis/    # 失败任务只读诊断 Skill
     ├── src/vps_proxy_manager/       # Bot、任务、SSH、解析、配置、Codex Worker
     ├── migrations/                  # Alembic 迁移
     ├── scripts/                     # 安装、升级、卸载、紧急恢复
@@ -65,6 +66,7 @@ sudo ./scripts/install.sh
 /opt/vps-proxy-manager
 /etc/vps-proxy-manager/vps-proxy-manager.env
 /root/.codex/skills/vps-proxy-target-bootstrap
+/root/.codex/skills/vps-proxy-task-diagnosis
 ```
 
 生成加密密钥并编辑配置：

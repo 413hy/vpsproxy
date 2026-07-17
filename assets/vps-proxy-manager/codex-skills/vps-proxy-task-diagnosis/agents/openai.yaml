@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPS Proxy Task Diagnosis"
+  short_description: "Read-only analysis of sanitized failed tasks"
+  default_prompt: "Use $vps-proxy-task-diagnosis to analyze the supplied sanitized failure context and return the required structured diagnosis."

@@ -15,7 +15,7 @@ from vps_proxy_manager.models import Base
 
 
 def create_engine(database_url: str) -> AsyncEngine:
-    connect_args = {"timeout": 30} if database_url.startswith("sqlite") else {}
+    connect_args = {"timeout": 60} if database_url.startswith("sqlite") else {}
     engine = create_async_engine(database_url, future=True, connect_args=connect_args)
     if database_url.startswith("sqlite"):
 
@@ -24,6 +24,8 @@ def create_engine(database_url: str) -> AsyncEngine:
             cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=60000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
             cursor.close()
 
     return engine

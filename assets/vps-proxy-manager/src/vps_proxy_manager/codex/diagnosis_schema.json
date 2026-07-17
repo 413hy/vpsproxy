@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "severity",
+    "summary",
+    "root_cause",
+    "evidence",
+    "recommended_actions",
+    "retry_safe"
+  ],
+  "properties": {
+    "severity": {
+      "type": "string",
+      "enum": ["info", "warning", "error", "critical"]
+    },
+    "summary": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "root_cause": {
+      "type": "string",
+      "maxLength": 1200
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "maxLength": 500}
+    },
+    "recommended_actions": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "maxLength": 500}
+    },
+    "retry_safe": {
+      "type": "boolean"
+    }
+  }
+}

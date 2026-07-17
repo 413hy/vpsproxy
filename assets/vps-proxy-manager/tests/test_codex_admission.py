@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from vps_proxy_manager.codex.worker import provision_candidate
+from vps_proxy_manager.codex.worker import CodexWorker, provision_candidate
+from vps_proxy_manager.config import Settings
 from vps_proxy_manager.crypto import SecretBox, generate_key
 from vps_proxy_manager.db import create_engine, create_sessionmaker
 from vps_proxy_manager.models import (
@@ -12,6 +14,9 @@ from vps_proxy_manager.models import (
     Base,
     CodexTaskStatus,
     HostLifecycle,
+    Task,
+    TaskKind,
+    TaskStatus,
 )
 from vps_proxy_manager.services.repository import Repository
 
@@ -83,4 +88,68 @@ async def test_candidate_enters_vps_inventory_only_after_codex_admission() -> No
         assert len(hosts) == 1
         assert candidate.lifecycle == HostLifecycle.ready
         assert task.status == CodexTaskStatus.succeeded
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_codex_diagnosis_context_and_result_are_linked_to_failed_task() -> None:
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = create_sessionmaker(engine)
+    key = generate_key()
+    secret_box = SecretBox(key)
+    async with factory() as session:
+        repo = Repository(session, secret_box)
+        source = await repo.create_task(
+            kind=TaskKind.vps_subscription_test,
+            actor_user_id=1,
+            payload={"vps_subscription_id": 7},
+        )
+        source.status = TaskStatus.failed
+        source.error_code = "internal_error"
+        source.message = "任务失败"
+        source.result = {
+            "technical_error": "database is locked",
+            "exception_type": "OperationalError",
+        }
+        diagnostic = await repo.create_codex_diagnostic(source.id)
+        diagnostic.status = CodexTaskStatus.running
+        await session.commit()
+        source_id, diagnostic_id = source.id, diagnostic.id
+    worker = CodexWorker(
+        factory,
+        Settings(
+            telegram_bot_token="test-token-placeholder-value",  # noqa: S106
+            admin_user_ids=[1],
+            secret_key=key,
+        ),
+        secret_box,
+    )
+    worker._notify_diagnosis = AsyncMock()  # type: ignore[method-assign]
+
+    context = await worker._diagnostic_context(diagnostic_id)
+    assert context["source_task"]["technical_result"]["technical_error"] == "database is locked"
+    assert "credentials" not in str(context).lower()
+
+    await worker._complete_diagnosis(
+        diagnostic_id,
+        {
+            "severity": "error",
+            "summary": "SQLite 写事务冲突",
+            "root_cause": "长事务与进度更新争用写锁",
+            "evidence": ["database is locked"],
+            "recommended_actions": ["提交条目后再测速"],
+            "retry_safe": True,
+        },
+    )
+
+    async with factory() as session:
+        repo = Repository(session, secret_box)
+        diagnostic = await repo.get_codex_task(diagnostic_id)
+        source = await session.get(Task, source_id)
+        assert diagnostic.status == CodexTaskStatus.succeeded
+        assert diagnostic.result["model"] == "gpt-5.6-sol"
+        assert source is not None
+        assert source.result["codex_diagnostic"]["retry_safe"] is True
     await engine.dispose()

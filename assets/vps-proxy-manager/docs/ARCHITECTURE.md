@@ -48,7 +48,12 @@ sing-box TUN + systemd rollback timer
 
 添加向导先捕获主机公钥、展示 SHA256 指纹、测试认证和系统信息。确认后只创建 `vps_candidates`，不创建 `vps_hosts`。
 
-Codex Worker 预留一条 `codex_tasks` 记录后，以 `codex exec --ephemeral` 调用准入 Skill。提示词只包含候选和任务整数 ID。Skill 只能执行 `provision-candidate` CLI，CLI 才能解密 SSH 凭据并调用固定远端初始化 action。
+Codex Worker 处理两类记录：
+
+- `provision`：以 `danger-full-access` 调用准入 Skill。提示词只包含候选和任务整数 ID，Skill 只能执行 `provision-candidate` 固定 CLI。
+- `diagnose`：普通后台任务系统级失败时自动创建。Worker 先生成权限 `0600` 的脱敏上下文，再以 `read-only` 调用诊断 Skill；Codex 只读源码和上下文，返回结构化根因、证据、建议与 `retry_safe`。它不能自动重试或修改网络。
+
+两类任务都显式使用配置的 Codex 模型和推理强度。诊断完成或失败后，Worker 主动向管理员发送 Telegram 消息。
 
 初始化准入检查：
 

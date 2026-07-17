@@ -11,7 +11,7 @@ Operate the project bundled under `assets/vps-proxy-manager/`. Read `CODEX_HANDO
 
 - Act only on VPS hosts owned by the user or explicitly authorized by the user.
 - Never turn Telegram text into generated shell commands.
-- Use only project CLI commands, fixed Python task handlers, the SSH action allowlist, and the installed `$vps-proxy-target-bootstrap` Skill.
+- Use only project CLI commands, fixed Python task handlers, the SSH action allowlist, and the installed `$vps-proxy-target-bootstrap` and `$vps-proxy-task-diagnosis` Skills.
 - Never print or commit Bot tokens, SSH credentials, private keys, encryption keys, full node links, or subscription URLs.
 - Keep SSH host-key verification, per-host mutation locking, high-risk confirmations, and target rollback timers enabled.
 - Treat `切回本地出口` as persistent `stop_proxy`; it is separate from rollback, uninstall, and deleting the VPS record.

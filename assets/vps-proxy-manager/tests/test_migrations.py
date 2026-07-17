@@ -52,6 +52,11 @@ def test_legacy_subscription_nodes_migrate_to_separate_entries(tmp_path: Path, m
             "SELECT subscription_id, name, last_latency_ms FROM subscription_entries"
         ).fetchone()
         count = connection.execute("SELECT node_count FROM subscriptions WHERE id = 1").fetchone()
+        codex_columns = {
+            row[1]: row for row in connection.execute("PRAGMA table_info(codex_tasks)").fetchall()
+        }
     assert entry == (1, "legacy-entry", 100)
     assert count == (1,)
+    assert codex_columns["candidate_id"][3] == 0
+    assert "source_task_id" in codex_columns
     get_settings.cache_clear()

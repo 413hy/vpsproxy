@@ -18,18 +18,24 @@ sudo journalctl -u vps-proxy-manager.service -u vps-proxy-codex-worker.service -
 - `Conflict: terminated by other getUpdates`：同一 Token 有第二个 polling 实例，停止旧实例。
 - Telegram API 超时：检查控制端 DNS、IPv4/IPv6 和到 `api.telegram.org` 的访问。
 
-## Codex 初始化不运行
+## Codex 初始化或自动诊断不运行
 
 ```bash
 sudo codex login status
 sudo systemctl status vps-proxy-codex-worker.service --no-pager
 ls -ld /root/.codex/skills/vps-proxy-target-bootstrap
+ls -ld /root/.codex/skills/vps-proxy-task-diagnosis
 ```
 
 - `codex_unavailable`：`VPSPM_CODEX_CLI` 路径错误。
 - `Codex CLI is not logged in`：以 root 完成 Codex 登录；systemd 使用 `/root/.codex`。
 - `codex_no_result`：Codex 未调用固定准入命令，检查准入 Skill 是否完整。
+- `codex_invalid_result`：诊断没有返回符合 JSON Schema 的结构化结果。
 - Worker 重启会把 running 任务标记失败；在 Telegram 待初始化列表手工重试。
+
+## VPS 订阅测速出现 database is locked
+
+0.3.0 已在保存订阅条目后提交事务，再并发测速和更新进度，并启用 SQLite WAL、60 秒 busy timeout。升级后重新执行该 VPS 的订阅测速。旧失败任务不会自动重放，但会保留在任务中心。
 
 ## SSH
 

@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     codex_work_dir: Path = Path("/opt/vps-proxy-manager")
     codex_poll_seconds: int = 3
     codex_timeout_seconds: int = 900
+    codex_model: str = "gpt-5.6-sol"
+    codex_reasoning_effort: str = "xhigh"
 
     @field_validator("admin_user_ids", "allowed_chat_ids", mode="before")
     @classmethod
@@ -55,6 +57,14 @@ class Settings(BaseSettings):
         if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
             raise ValueError("invalid log level")
         return level
+
+    @field_validator("codex_reasoning_effort")
+    @classmethod
+    def validate_codex_reasoning_effort(cls, value: str) -> str:
+        effort = value.lower()
+        if effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+            raise ValueError("invalid Codex reasoning effort")
+        return effort
 
 
 @lru_cache

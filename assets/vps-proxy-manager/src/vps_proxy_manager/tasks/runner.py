@@ -28,6 +28,7 @@ from vps_proxy_manager.proxy.ssrf import fetch_subscription
 from vps_proxy_manager.proxy.tester import LocalProxyTester
 from vps_proxy_manager.services.repository import Repository
 from vps_proxy_manager.ssh.client import SSHClient, SSHError, credentials_from_host
+from vps_proxy_manager.utils.redact import redact_text
 
 log = structlog.get_logger()
 
@@ -56,6 +57,8 @@ RESTART_SAFE = {
     TaskKind.vps_node_test,
     TaskKind.vps_subscription_test,
 }
+
+NON_DIAGNOSABLE_ERRORS = {"host_busy"}
 
 
 class TaskCanceled(RuntimeError):
@@ -130,6 +133,7 @@ class TaskRunner:
                 task.error_code = "controller_restarted"
                 task.message = "控制端重启，任务未自动重放；请手动确认后重试"
                 task.finished_at = datetime.now(UTC)
+                await self._queue_codex_diagnostic(session, task)
             await session.commit()
 
     async def _work(self) -> None:
@@ -226,7 +230,17 @@ class TaskRunner:
             await session.rollback()
             recovered = await session.get(Task, task_id)
             if recovered:
-                await self._finish(session, recovered, TaskStatus.failed, exc.code, str(exc))
+                await self._finish(
+                    session,
+                    recovered,
+                    TaskStatus.failed,
+                    exc.code,
+                    str(exc),
+                    {
+                        "exception_type": type(exc).__name__,
+                        "technical_error": redact_text(str(exc))[:1500],
+                    },
+                )
         except Exception as exc:  # noqa: BLE001
             await session.rollback()
             log.exception("task_failed", task_id=task_id, kind=task_kind, error=str(exc))
@@ -237,7 +251,11 @@ class TaskRunner:
                     recovered,
                     TaskStatus.failed,
                     "internal_error",
-                    "任务失败，请查看脱敏日志",
+                    "任务失败，正在交给 Codex 自动诊断",
+                    {
+                        "exception_type": type(exc).__name__,
+                        "technical_error": redact_text(str(exc))[:1500],
+                    },
                 )
 
     async def _detect(self, session: AsyncSession, task: Task) -> None:
@@ -313,6 +331,9 @@ class TaskRunner:
             )
             specs = parse_subscription_text(content)
             await repo.update_subscription_content(sub, content, specs)
+            # Progress updates use short independent sessions. Release the subscription
+            # refresh write transaction before those updates start.
+            await session.commit()
         entries = list(await repo.list_subscription_entries(sub.id, limit=10000))
         if not entries:
             raise ValueError("subscription has no testable nodes")
@@ -361,7 +382,7 @@ class TaskRunner:
                     )
                 return item, result
 
-        return list(await asyncio.gather(*(test_one(item, spec) for item, spec in pairs)))
+        return await self._gather_tests([test_one(item, spec) for item, spec in pairs])
 
     async def _sync_node(self, session: AsyncSession, task: Task) -> None:
         repo = Repository(session, self.secret_box)
@@ -461,6 +482,8 @@ class TaskRunner:
         specs = parse_subscription_text(content)
         sub.encrypted_content = self.secret_box.encrypt(content)
         entries = await repo.replace_vps_subscription_entries(sub, specs)
+        # Do not hold SQLite's writer lock while concurrent tests publish progress.
+        await session.commit()
         results = await self._run_remote_tests(session, task, host, entries)
         for item, result in results:
             await repo.update_node_test(item, result)
@@ -517,9 +540,7 @@ class TaskRunner:
                     )
                 return item, test
 
-        return list(
-            await asyncio.gather(*(test_one(index, item) for index, item in enumerate(items)))
-        )
+        return await self._gather_tests([test_one(index, item) for index, item in enumerate(items)])
 
     async def _apply_proxy(self, session: AsyncSession, task: Task) -> None:
         repo = Repository(session, self.secret_box)
@@ -847,6 +868,22 @@ class TaskRunner:
         if status == TaskStatus.cancel_requested:
             raise TaskCanceled
 
+    @staticmethod
+    async def _gather_tests(
+        awaitables: Sequence[Awaitable[tuple[Any, dict[str, Any]]]],
+    ) -> list[tuple[Any, dict[str, Any]]]:
+        workers: list[asyncio.Task[tuple[Any, dict[str, Any]]]] = [
+            asyncio.create_task(item) for item in awaitables
+        ]
+        try:
+            return list(await asyncio.gather(*workers))
+        except BaseException:
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            raise
+
     async def _progress(self, task_id: int, value: int, message: str) -> None:
         async with self.session_factory() as session:
             task = await session.get(Task, task_id)
@@ -901,4 +938,29 @@ class TaskRunner:
         task.result = result or {}
         task.progress = 100
         task.finished_at = datetime.now(UTC)
+        if status == TaskStatus.failed:
+            await self._queue_codex_diagnostic(session, task)
         await session.commit()
+
+    async def _queue_codex_diagnostic(self, session: AsyncSession, task: Task) -> None:
+        if (
+            not self.settings.codex_enabled
+            or task.error_code in NON_DIAGNOSABLE_ERRORS
+            or task.id is None
+        ):
+            return
+        repo = Repository(session, self.secret_box)
+        diagnostic = await repo.create_codex_diagnostic(task.id)
+        task.result = {
+            **(task.result or {}),
+            "codex_diagnostic_task_id": diagnostic.id,
+        }
+        if f"Codex 自动诊断 #{diagnostic.id}" not in task.message:
+            task.message = f"{task.message}；Codex 自动诊断 #{diagnostic.id} 已排队"
+        await repo.audit(
+            actor_user_id=task.actor_user_id,
+            action="codex_diagnosis_queued",
+            result="queued",
+            host_id=task.host_id,
+            detail={"source_task_id": task.id, "codex_task_id": diagnostic.id},
+        )

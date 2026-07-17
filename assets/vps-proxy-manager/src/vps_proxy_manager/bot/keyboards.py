@@ -538,8 +538,20 @@ def task_list(rows_data: Sequence[tuple[int, str, str, int]]) -> InlineKeyboardM
     return InlineKeyboardMarkup(rows)
 
 
-def task_detail(task_id: int, active: bool) -> InlineKeyboardMarkup:
+def task_detail(
+    task_id: int,
+    active: bool,
+    *,
+    result_callback: str | None = None,
+    codex_task_id: int | None = None,
+) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("刷新", callback_data=f"t:v:{task_id}")]]
+    if result_callback:
+        rows.append([InlineKeyboardButton("查看各节点测速结果", callback_data=result_callback)])
+    if codex_task_id:
+        rows.append(
+            [InlineKeyboardButton("查看 Codex 自动诊断", callback_data=f"ct:v:{codex_task_id}")]
+        )
     if active:
         rows.append([InlineKeyboardButton("取消任务", callback_data=f"t:cancel:{task_id}")])
     rows.append([InlineKeyboardButton("返回任务中心", callback_data="t:list")])

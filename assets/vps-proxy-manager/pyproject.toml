@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vps-proxy-manager"
-version = "0.2.0"
+version = "0.3.0"
 description = "Telegram controlled manager for authorized VPS sing-box global proxy routing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,9 @@ vps-proxy-manager = "vps_proxy_manager.__main__:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+vps_proxy_manager = ["codex/*.json"]
 
 [tool.ruff]
 line-length = 100
