@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from vps_proxy_manager.models import AuthMethod
@@ -40,6 +42,7 @@ async def test_remote_action_allowlist_rejects_command_injection_before_connect(
 class FakeConnection:
     def __init__(self) -> None:
         self.commands: list[str] = []
+        self.inputs: list[str] = []
 
     async def __aenter__(self):
         return self
@@ -49,6 +52,7 @@ class FakeConnection:
 
     async def run(self, command: str, **_kwargs: object) -> object:
         self.commands.append(command)
+        self.inputs.append(str(_kwargs.get("input") or ""))
         return type(
             "Result",
             (),
@@ -90,3 +94,42 @@ async def test_non_root_target_uses_noninteractive_sudo() -> None:
     )
     await ssh.run_agent(credentials, "status", {})
     assert ssh.connection.commands == ["sudo -n /usr/local/sbin/vpspm-agent status"]
+
+
+@pytest.mark.asyncio
+async def test_payload_transfer_wrapper_is_ascii_only() -> None:
+    ssh = RecordingSSH()
+    credentials = SSHCredentials(
+        host="example.com",
+        port=22,
+        username="root",
+        auth_method=AuthMethod.password,
+        secret="test-only",  # noqa: S106
+    )
+    await ssh.run_payload(credentials, "upgrade_agent", {})
+    assert ssh.connection.commands == ["python3 - upgrade_agent"]
+    assert ssh.connection.inputs[0].isascii()
+    assert "base64.b64decode" in ssh.connection.inputs[0]
+
+
+def test_remote_error_preserves_structured_detail() -> None:
+    result = type(
+        "Result",
+        (),
+        {
+            "exit_status": 0,
+            "stdout": json.dumps(
+                {
+                    "ok": False,
+                    "code": "singbox_start_failed",
+                    "message": "service failed",
+                    "detail": '{"Result":"exit-code"}',
+                }
+            ),
+            "stderr": "",
+        },
+    )()
+    with pytest.raises(SSHError) as raised:
+        SSHClient()._parse_result(result)  # type: ignore[arg-type]
+    assert raised.value.code == "singbox_start_failed"
+    assert "exit-code" in raised.value.detail

@@ -159,7 +159,7 @@ def build_tun_config(
         "dns": {
             "servers": [
                 {"tag": "remote-dns", "type": "https", "server": "1.1.1.1", "detour": "proxy"},
-                {"tag": "local-dns", "type": "udp", "server": "223.5.5.5", "detour": "direct"},
+                {"tag": "local-dns", "type": "udp", "server": "223.5.5.5"},
             ],
             "strategy": "prefer_ipv4",
             "final": "remote-dns",
@@ -171,6 +171,7 @@ def build_tun_config(
                 "address": addresses,
                 "auto_route": True,
                 "auto_redirect": auto_redirect,
+                "route_exclude_address": exclude,
                 "strict_route": True,
                 "stack": "mixed",
             }

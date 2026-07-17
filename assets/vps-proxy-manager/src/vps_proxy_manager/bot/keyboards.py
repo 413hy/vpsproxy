@@ -544,6 +544,7 @@ def task_detail(
     *,
     result_callback: str | None = None,
     codex_task_id: int | None = None,
+    resolved_task_id: int | None = None,
 ) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("刷新", callback_data=f"t:v:{task_id}")]]
     if result_callback:
@@ -551,6 +552,15 @@ def task_detail(
     if codex_task_id:
         rows.append(
             [InlineKeyboardButton("查看 Codex 自动诊断", callback_data=f"ct:v:{codex_task_id}")]
+        )
+    if resolved_task_id:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"查看解决任务 #{resolved_task_id}",
+                    callback_data=f"t:v:{resolved_task_id}",
+                )
+            ]
         )
     if active:
         rows.append([InlineKeyboardButton("取消任务", callback_data=f"t:cancel:{task_id}")])

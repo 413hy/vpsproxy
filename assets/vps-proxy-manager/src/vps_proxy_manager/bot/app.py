@@ -1239,6 +1239,7 @@ async def show_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
             active,
             result_callback=_task_result_callback(item),
             codex_task_id=_task_codex_id(item),
+            resolved_task_id=_resolved_task_id(item),
         ),
     )
 
@@ -1704,7 +1705,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     error = context.error
-    log.exception(
+    log.error(
         "telegram_update_failed",
         error_type=type(error).__name__,
         error=redact_text(str(error)),
@@ -1762,6 +1763,7 @@ async def _monitor_task(
                         active,
                         result_callback=_task_result_callback(task),
                         codex_task_id=_task_codex_id(task),
+                        resolved_task_id=_resolved_task_id(task),
                     ),
                 )
             except BadRequest as exc:
@@ -1894,10 +1896,12 @@ def _outbound_info(status: dict[str, Any]) -> tuple[str, str]:
 
 
 def _task_text(task: Task) -> str:
+    resolved_task_id = _resolved_task_id(task)
     return (
         f"任务 #{task.id}\n类型：{task.kind.value}\n状态：{task.status.value}\n"
         f"进度：{task.progress}%\n结果：{task.message}"
         + (f"\n错误代码：{task.error_code}" if task.error_code else "")
+        + (f"\n解决状态：已由任务 #{resolved_task_id} 验证解决" if resolved_task_id else "")
     )
 
 
@@ -1917,6 +1921,11 @@ def _task_result_callback(task: Task) -> str | None:
 
 def _task_codex_id(task: Task) -> int | None:
     value = (task.result or {}).get("codex_diagnostic_task_id")
+    return int(value) if isinstance(value, int | str) and str(value).isdigit() else None
+
+
+def _resolved_task_id(task: Task) -> int | None:
+    value = (task.result or {}).get("resolved_by_task_id")
     return int(value) if isinstance(value, int | str) and str(value).isdigit() else None
 
 

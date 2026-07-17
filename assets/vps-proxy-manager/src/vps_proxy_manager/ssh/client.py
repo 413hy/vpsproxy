@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import tempfile
@@ -16,6 +17,7 @@ from vps_proxy_manager.remote import payload as remote_payload
 REMOTE_ACTIONS = {
     "detect",
     "initialize",
+    "upgrade_agent",
     "store_node",
     "store_subscription",
     "remove_node",
@@ -33,9 +35,10 @@ REMOTE_ACTIONS = {
 
 
 class SSHError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, detail: str = "") -> None:
         super().__init__(message)
         self.code = code
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -179,13 +182,21 @@ class SSHClient:
         stdin = json.dumps(data or {}, ensure_ascii=False)
         privilege = "" if not sudo or creds.username == "root" else "sudo -n "
         cmd = f"{privilege}python3 - {action}"
+        persisted_source = source + '\nif __name__ == "__main__":\n    main()\n'
+        source_b64 = base64.b64encode(source.encode("utf-8")).decode("ascii")
+        persisted_b64 = base64.b64encode(persisted_source.encode("utf-8")).decode("ascii")
+        data_b64 = base64.b64encode(stdin.encode("utf-8")).decode("ascii")
+        # Keep the SSH stdin wrapper ASCII-only so target locale settings cannot
+        # corrupt non-ASCII messages embedded in the reviewed Agent source.
         script = (
-            source
-            + "\n_PAYLOAD_SOURCE = "
-            + repr(source + '\nif __name__ == "__main__":\n    main()\n')
-            + "\n_PAYLOAD_DATA = "
-            + repr(stdin)
-            + "\nmain()\n"
+            "import base64\n"
+            f"source = base64.b64decode('{source_b64}').decode('utf-8')\n"
+            f"persisted = base64.b64decode('{persisted_b64}').decode('utf-8')\n"
+            f"data = base64.b64decode('{data_b64}').decode('utf-8')\n"
+            "namespace = {'__name__': 'vpspm_payload', "
+            "'_PAYLOAD_SOURCE': persisted, '_PAYLOAD_DATA': data}\n"
+            "exec(compile(source, '<vpspm-agent>', 'exec'), namespace)\n"
+            "namespace['main']()\n"
         )
         async with await self.connect(creds) as conn:
             result = await conn.run(cmd, input=script, timeout=timeout)
@@ -229,7 +240,10 @@ class SSHClient:
         except Exception as exc:
             raise SSHError("remote_payload_bad_output", "远端返回结果格式错误") from exc
         if not parsed.get("ok", False):
+            detail = str(parsed.get("detail") or "")
             raise SSHError(
-                str(parsed.get("code", "remote_error")), str(parsed.get("message", "远端错误"))
+                str(parsed.get("code", "remote_error")),
+                str(parsed.get("message", "远端错误")),
+                detail=detail,
             )
         return parsed

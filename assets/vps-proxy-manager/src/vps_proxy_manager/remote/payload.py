@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -15,7 +16,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-AGENT_VERSION = "0.2.0"
+AGENT_VERSION = "0.3.1"
 BASE = Path("/etc/vps-proxy-manager")
 BACKUPS = BASE / "backups"
 LIBRARY = BASE / "library"
@@ -25,6 +26,9 @@ SINGBOX_CONFIG = Path("/etc/sing-box/config.json")
 ROLLBACK_SCRIPT = BASE / "rollback-last.sh"
 ROLLBACK_SERVICE = Path("/etc/systemd/system/vpspm-rollback.service")
 ROLLBACK_TIMER = Path("/etc/systemd/system/vpspm-rollback.timer")
+ACTIVATION_STATUS = BASE / "last-activation.json"
+ACTIVATION_SERVICE = Path("/etc/systemd/system/vpspm-activate.service")
+ACTIVATION_TIMER = Path("/etc/systemd/system/vpspm-activate.timer")
 AGENT_SOURCE = Path("/usr/local/lib/vpspm-agent/agent.py")
 AGENT_BIN = Path("/usr/local/sbin/vpspm-agent")
 LOCAL_SINGBOX_SERVICE = Path("/etc/systemd/system/sing-box.service")
@@ -299,6 +303,13 @@ def initialize() -> None:
     )
 
 
+def upgrade_agent() -> None:
+    require_supported_system()
+    ensure_layout()
+    persist_agent()
+    ok({"upgraded": True, "agent_version": AGENT_VERSION})
+
+
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
@@ -498,6 +509,7 @@ def write_rollback(backup: Path) -> None:
     script = f"""#!/usr/bin/env bash
 set -euo pipefail
 systemctl disable --now vpspm-rollback.timer 2>/dev/null || true
+systemctl disable --now vpspm-activate.timer 2>/dev/null || true
 systemctl stop sing-box.service 2>/dev/null || true
 if [ -f "{backup}/config.json" ]; then
   install -d -m 755 /etc/sing-box
@@ -525,6 +537,138 @@ fi
     atomic_write(ROLLBACK_SCRIPT, script, 0o700)
 
 
+def service_snapshot() -> dict[str, Any]:
+    result = run(
+        [
+            "systemctl",
+            "show",
+            "sing-box.service",
+            "--property=ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,NRestarts",
+        ],
+        check=False,
+    )
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    return values
+
+
+def recent_service_error() -> str:
+    journal = run(
+        [
+            "journalctl",
+            "-u",
+            "sing-box.service",
+            "--since",
+            "1 minute ago",
+            "-n",
+            "40",
+            "--no-pager",
+            "-o",
+            "cat",
+        ],
+        check=False,
+    )
+    lines = [
+        line.strip()
+        for line in journal.stdout.splitlines()
+        if "FATAL" in line.upper() or "ERROR" in line.upper()
+    ]
+    text = "\n".join(lines[-3:])[-1200:]
+    text = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        "[uuid-redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r'(?i)(password|private_key|public_key|uuid)(["\s:=]+)([^,}\s]+)',
+        r"\1\2[redacted]",
+        text,
+    )
+
+
+def wait_for_stable_service(*, timeout: float = 6.0, stable_for: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    active_since: float | None = None
+    while time.monotonic() < deadline:
+        active = (
+            run(["systemctl", "is-active", "--quiet", "sing-box.service"], check=False).returncode
+            == 0
+        )
+        now = time.monotonic()
+        if active:
+            active_since = active_since or now
+            if now - active_since >= stable_for:
+                return True
+        else:
+            active_since = None
+        time.sleep(0.25)
+    return False
+
+
+def disarm_activation() -> None:
+    run(["systemctl", "disable", "--now", "vpspm-activate.timer"], check=False)
+
+
+def schedule_activation() -> None:
+    disarm_activation()
+    atomic_write(
+        ACTIVATION_SERVICE,
+        "[Unit]\nDescription=VPS Proxy Manager delayed proxy activation\n"
+        "After=network-online.target\nWants=network-online.target\n"
+        "[Service]\nType=oneshot\nExecStart=/usr/local/sbin/vpspm-agent activate_proxy\n",
+        0o644,
+    )
+    atomic_write(
+        ACTIVATION_TIMER,
+        "[Unit]\nDescription=VPS Proxy Manager delayed proxy activation timer\n"
+        "[Timer]\nOnActiveSec=2\nAccuracySec=100ms\nUnit=vpspm-activate.service\n"
+        "[Install]\nWantedBy=timers.target\n",
+        0o644,
+    )
+    atomic_write(
+        ACTIVATION_STATUS,
+        json.dumps({"state": "pending", "detail": {}}, ensure_ascii=False),
+        0o600,
+    )
+    run(["systemctl", "daemon-reload"], check=False)
+    scheduled = run(
+        ["systemctl", "enable", "--now", "vpspm-activate.timer"],
+        check=False,
+    )
+    if scheduled.returncode != 0:
+        run([str(ROLLBACK_SCRIPT)], check=False)
+        fail(
+            "proxy_activation_schedule_failed",
+            "代理延迟启动任务创建失败",
+            scheduled.stderr[-800:],
+        )
+
+
+def activate_proxy() -> None:
+    disarm_activation()
+    started = run(["systemctl", "start", "sing-box.service"], check=False, timeout=90)
+    if started.returncode != 0 or not wait_for_stable_service():
+        detail = service_snapshot()
+        detail["error"] = recent_service_error()
+        atomic_write(
+            ACTIVATION_STATUS,
+            json.dumps({"state": "failed", "detail": detail}, ensure_ascii=False),
+            0o600,
+        )
+        run([str(ROLLBACK_SCRIPT)], check=False)
+        fail("singbox_start_failed", "sing-box 启动后未能保持运行，已自动回滚")
+    atomic_write(
+        ACTIVATION_STATUS,
+        json.dumps({"state": "active", "detail": service_snapshot()}, ensure_ascii=False),
+        0o600,
+    )
+    ok({"activated": True})
+
+
 def arm_rollback(seconds: int) -> None:
     atomic_write(
         ROLLBACK_SERVICE,
@@ -550,6 +694,7 @@ def disarm_rollback() -> None:
 def add_proxy_server_bypass(config: dict[str, Any]) -> None:
     try:
         outbound = config["outbounds"][0]
+        inbound = config["inbounds"][0]
         server = str(outbound["server"])
         server_port = int(outbound["server_port"])
         rules = config["route"]["rules"]
@@ -568,6 +713,12 @@ def add_proxy_server_bypass(config: dict[str, Any]) -> None:
     if not cidrs or not isinstance(rules, list):
         fail("proxy_server_dns_failed", "代理服务器没有可用地址")
     rules.insert(2, {"ip_cidr": cidrs, "outbound": "direct"})
+    route_excludes = inbound.setdefault("route_exclude_address", [])
+    if not isinstance(route_excludes, list):
+        fail("bad_request", "TUN 绕过地址配置无效")
+    for cidr in cidrs:
+        if cidr not in route_excludes:
+            route_excludes.append(cidr)
 
 
 def apply_proxy() -> None:
@@ -596,14 +747,23 @@ def apply_proxy() -> None:
     finally:
         tmp.unlink(missing_ok=True)
     arm_rollback(rollback_seconds)
-    started = run(["systemctl", "enable", "--now", "sing-box.service"], check=False, timeout=90)
-    if started.returncode != 0:
+    enabled = run(["systemctl", "enable", "sing-box.service"], check=False, timeout=60)
+    if enabled.returncode != 0:
         run([str(ROLLBACK_SCRIPT)], check=False)
-        fail("singbox_start_failed", "sing-box 启动失败，已尝试回滚", started.stderr[-1200:])
-    ok({"backup": str(backup), "rollback_armed": True})
+        fail("singbox_enable_failed", "sing-box 开机启动配置失败，已自动回滚")
+    schedule_activation()
+    ok(
+        {
+            "backup": str(backup),
+            "rollback_armed": True,
+            "activation_scheduled": True,
+            "agent_version": AGENT_VERSION,
+        }
+    )
 
 
 def confirm_proxy() -> None:
+    disarm_activation()
     disarm_rollback()
     ok({"rollback_armed": False})
 
@@ -614,14 +774,25 @@ def rollback() -> None:
     result = run([str(ROLLBACK_SCRIPT)], check=False)
     if result.returncode != 0:
         fail("rollback_failed", "回滚执行失败", result.stderr[-1200:])
+    atomic_write(
+        ACTIVATION_STATUS,
+        json.dumps({"state": "rolled_back", "detail": {}}, ensure_ascii=False),
+        0o600,
+    )
     backup = Path((BASE / "last-backup").read_text(encoding="utf-8").strip())
     mode = "proxy" if (backup / "service-active").exists() else "local"
     ok({"rolled_back": True, "exit_mode": mode})
 
 
 def stop_proxy() -> None:
+    disarm_activation()
     disarm_rollback()
     run(["systemctl", "disable", "--now", "sing-box.service"], check=False)
+    atomic_write(
+        ACTIVATION_STATUS,
+        json.dumps({"state": "stopped", "detail": {}}, ensure_ascii=False),
+        0o600,
+    )
     ok({"stopped": True, "exit_mode": "local", "persistent": True})
 
 
@@ -631,22 +802,25 @@ def restore_proxy() -> None:
     backup = backup_state()
     write_rollback(backup)
     arm_rollback(120)
-    result = run(["systemctl", "enable", "--now", "sing-box.service"], check=False)
-    if result.returncode != 0:
+    enabled = run(["systemctl", "enable", "sing-box.service"], check=False)
+    if enabled.returncode != 0:
         run([str(ROLLBACK_SCRIPT)], check=False)
-        fail("restore_failed", "代理服务恢复失败", result.stderr[-1200:])
+        fail("restore_failed", "代理服务恢复配置失败，已自动回滚")
+    schedule_activation()
     ok(
         {
             "running": True,
             "exit_mode": "proxy",
             "persistent": True,
             "rollback_armed": True,
+            "activation_scheduled": True,
         }
     )
 
 
 def uninstall() -> None:
     safety_backup = backup_state()
+    disarm_activation()
     run(["systemctl", "disable", "--now", "sing-box.service"], check=False)
     run(["systemctl", "disable", "--now", "vpspm-rollback.timer"], check=False)
     original = original_backup()
@@ -660,6 +834,11 @@ def uninstall() -> None:
     if original is not None and not (original / "singbox-preexisting").exists():
         run(["apt-get", "remove", "-y", "sing-box"], check=False, timeout=300)
     mode = "proxy" if original is not None and (original / "service-active").exists() else "local"
+    atomic_write(
+        ACTIVATION_STATUS,
+        json.dumps({"state": "uninstalled", "detail": {}}, ensure_ascii=False),
+        0o600,
+    )
     ok(
         {
             "uninstalled": True,
@@ -673,6 +852,18 @@ def uninstall() -> None:
 def status() -> None:
     service = run(["systemctl", "is-active", "sing-box.service"], check=False)
     service_active = service.stdout.strip() == "active"
+    rollback_armed = (
+        run(["systemctl", "is-active", "--quiet", "vpspm-rollback.timer"], check=False).returncode
+        == 0
+    )
+    activation_status: dict[str, Any] = {}
+    if ACTIVATION_STATUS.exists():
+        try:
+            loaded_status = json.loads(ACTIVATION_STATUS.read_text(encoding="utf-8"))
+            if isinstance(loaded_status, dict):
+                activation_status = loaded_status
+        except (OSError, ValueError):
+            activation_status = {"state": "invalid", "detail": {}}
     version_lines = (
         run(["sing-box", "version"], check=False).stdout.splitlines()
         if shutil.which("sing-box")
@@ -716,6 +907,10 @@ def status() -> None:
         if shutil.which("curl")
         else None
     )
+    outbound_ok = bool(outbound and outbound.returncode == 0 and outbound.stdout.strip())
+    generate_204_ok = bool(
+        connectivity and connectivity.returncode == 0 and connectivity.stdout.strip() == "204"
+    )
     node_count = len(list(NODE_LIBRARY.glob("*.json"))) if NODE_LIBRARY.exists() else 0
     sub_count = (
         len(list(SUBSCRIPTION_LIBRARY.glob("*.json"))) if SUBSCRIPTION_LIBRARY.exists() else 0
@@ -725,6 +920,9 @@ def status() -> None:
             "status": {
                 "agent_version": AGENT_VERSION if AGENT_SOURCE.exists() else None,
                 "singbox_active": service.stdout.strip(),
+                "singbox_service": service_snapshot(),
+                "rollback_armed": rollback_armed,
+                "activation_status": activation_status,
                 "singbox_version": version_lines[0] if version_lines else "",
                 "dns_mode": "tun_hijack_to_proxy" if service_active else "system_local",
                 "outbound_probe": outbound.stdout[:800]
@@ -733,11 +931,11 @@ def status() -> None:
                 "outbound_error": outbound.stderr[:400]
                 if outbound and outbound.returncode != 0
                 else "",
-                "connectivity_ok": bool(
-                    connectivity
-                    and connectivity.returncode == 0
-                    and connectivity.stdout.strip() == "204"
-                ),
+                "connectivity_ok": outbound_ok or generate_204_ok,
+                "connectivity_probes": {
+                    "outbound_ip": outbound_ok,
+                    "generate_204": generate_204_ok,
+                },
                 "has_backup": (BASE / "last-backup").exists(),
                 "has_original_backup": original_backup() is not None,
                 "managed_library_exists": LIBRARY.exists(),
@@ -865,6 +1063,8 @@ def main() -> None:
     actions = {
         "detect": detect,
         "initialize": initialize,
+        "upgrade_agent": upgrade_agent,
+        "activate_proxy": activate_proxy,
         "store_node": store_node,
         "store_subscription": store_subscription,
         "remove_node": remove_node,

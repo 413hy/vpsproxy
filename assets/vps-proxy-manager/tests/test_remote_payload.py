@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import Any
 
 import pytest
@@ -64,13 +65,16 @@ def test_restore_proxy_enables_service_persistently(monkeypatch: Any, tmp_path: 
     monkeypatch.setattr(payload, "backup_state", lambda: backup)
     monkeypatch.setattr(payload, "write_rollback", rollback_calls.append)
     monkeypatch.setattr(payload, "arm_rollback", armed.append)
+    scheduled: list[bool] = []
+    monkeypatch.setattr(payload, "schedule_activation", lambda: scheduled.append(True))
     config = tmp_path / "config.json"
     config.write_text("{}")
     monkeypatch.setattr(payload, "SINGBOX_CONFIG", config)
     payload.restore_proxy()
-    assert ["systemctl", "enable", "--now", "sing-box.service"] in calls
+    assert ["systemctl", "enable", "sing-box.service"] in calls
     assert rollback_calls == [backup]
     assert armed == [120]
+    assert scheduled == [True]
 
 
 def test_restore_backup_keeps_stopped_service_stopped(monkeypatch: Any, tmp_path: Path) -> None:
@@ -100,8 +104,93 @@ def test_restore_backup_keeps_stopped_service_stopped(monkeypatch: Any, tmp_path
     assert ["systemctl", "start", "sing-box.service"] not in calls
 
 
+def test_apply_proxy_schedules_activation_before_network_change(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    base = tmp_path / "base"
+    config_path = tmp_path / "sing-box" / "config.json"
+    rollback_script = base / "rollback-last.sh"
+    rollback_script.parent.mkdir(parents=True)
+    rollback_script.write_text("#!/bin/sh\n")
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_: object) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(payload, "BASE", base)
+    monkeypatch.setattr(payload, "SINGBOX_CONFIG", config_path)
+    monkeypatch.setattr(payload, "ROLLBACK_SCRIPT", rollback_script)
+    monkeypatch.setattr(payload, "read_input", lambda: {"config": {"outbounds": [], "route": {}}})
+    monkeypatch.setattr(payload, "add_proxy_server_bypass", lambda _config: None)
+    monkeypatch.setattr(payload, "ensure_layout", lambda: config_path.parent.mkdir(parents=True))
+    monkeypatch.setattr(payload, "ensure_tun", lambda: None)
+    monkeypatch.setattr(payload, "backup_state", lambda: backup)
+    monkeypatch.setattr(payload, "write_rollback", lambda _backup: None)
+    monkeypatch.setattr(payload, "install_singbox", lambda: None)
+    monkeypatch.setattr(payload, "write_service", lambda: None)
+    monkeypatch.setattr(payload, "arm_rollback", lambda _seconds: None)
+    scheduled: list[bool] = []
+    monkeypatch.setattr(payload, "schedule_activation", lambda: scheduled.append(True))
+    monkeypatch.setattr(payload, "run", fake_run)
+
+    payload.apply_proxy()
+
+    response = capsys.readouterr().out
+    assert '"activation_scheduled": true' in response
+    assert ["systemctl", "enable", "sing-box.service"] in calls
+    assert ["systemctl", "enable", "--now", "sing-box.service"] not in calls
+    assert scheduled == [True]
+
+
+def test_delayed_activation_rolls_back_when_service_does_not_stabilize(
+    monkeypatch: Any, tmp_path: Path, capsys: Any
+) -> None:
+    status_path = tmp_path / "activation.json"
+    rollback_script = tmp_path / "rollback.sh"
+    rollback_script.write_text("#!/bin/sh\n")
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **_: object) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(payload, "ACTIVATION_STATUS", status_path)
+    monkeypatch.setattr(payload, "ROLLBACK_SCRIPT", rollback_script)
+    monkeypatch.setattr(payload, "disarm_activation", lambda: None)
+    monkeypatch.setattr(payload, "wait_for_stable_service", lambda: False)
+    monkeypatch.setattr(payload, "service_snapshot", lambda: {"Result": "exit-code"})
+    monkeypatch.setattr(payload, "run", fake_run)
+
+    with pytest.raises(SystemExit):
+        payload.activate_proxy()
+
+    response = capsys.readouterr().out
+    assert '"code": "singbox_start_failed"' in response
+    assert [str(rollback_script)] in calls
+    assert '"state": "failed"' in status_path.read_text()
+
+
+def test_recent_service_error_redacts_credentials(monkeypatch: Any) -> None:
+    raw = (
+        "FATAL uuid=11111111-1111-4111-8111-111111111111 "
+        'password="do-not-log" configuration failed\n'
+    )
+
+    def fake_run(_argv: list[str], **_: object) -> CompletedProcess[str]:
+        return CompletedProcess([], 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(payload, "run", fake_run)
+    result = payload.recent_service_error()
+    assert "11111111" not in result
+    assert "do-not-log" not in result
+
+
 def test_target_adds_resolved_proxy_server_bypass(monkeypatch: Any) -> None:
     config = {
+        "inbounds": [{"type": "tun", "route_exclude_address": []}],
         "outbounds": [{"server": "proxy.example", "server_port": 443}],
         "route": {"rules": [{"action": "sniff"}, {"protocol": "dns"}]},
     }
@@ -117,3 +206,4 @@ def test_target_adds_resolved_proxy_server_bypass(monkeypatch: Any) -> None:
         "ip_cidr": ["203.0.113.10/32"],
         "outbound": "direct",
     }
+    assert "203.0.113.10/32" in config["inbounds"][0]["route_exclude_address"]

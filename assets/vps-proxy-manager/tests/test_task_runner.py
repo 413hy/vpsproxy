@@ -25,9 +25,19 @@ from vps_proxy_manager.tasks.runner import TaskRunner
 
 
 class FakeSSH:
-    def __init__(self, *, connectivity_ok: bool = True) -> None:
+    def __init__(
+        self, *, connectivity_ok: bool = True, activation_states: list[str] | None = None
+    ) -> None:
         self.connectivity_ok = connectivity_ok
+        self.activation_states = list(activation_states or [])
         self.actions: list[str] = []
+
+    async def run_payload(
+        self, _creds: object, action: str, _data: dict[str, Any], *, timeout: int
+    ) -> dict[str, Any]:
+        self.actions.append(action)
+        assert action == "upgrade_agent"
+        return {"agent_version": "0.3.1"}
 
     async def run_agent(
         self, _creds: object, action: str, _data: dict[str, Any], *, timeout: int
@@ -43,10 +53,16 @@ class FakeSSH:
         if action == "apply_proxy":
             return {"backup": "/safe/backup", "rollback_armed": True}
         if action == "status":
+            activation_state = self.activation_states.pop(0) if self.activation_states else None
             return {
                 "status": {
                     "singbox_active": "active",
                     "connectivity_ok": self.connectivity_ok,
+                    **(
+                        {"activation_status": {"state": activation_state}}
+                        if activation_state
+                        else {}
+                    ),
                 }
             }
         if action == "confirm_proxy":
@@ -147,7 +163,26 @@ async def test_apply_proxy_confirms_only_after_remote_connectivity_verification(
         assert task is not None and task.status == TaskStatus.succeeded
         assert state.mode == ProxyMode.proxy
         assert task.result["previous_state"]["mode"] == ProxyMode.local.value
-    assert ssh.actions == ["detect", "apply_proxy", "status", "confirm_proxy"]
+        assert task.result["status"]["rollback_armed"] is False
+    assert ssh.actions == ["upgrade_agent", "detect", "apply_proxy", "status", "confirm_proxy"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_apply_proxy_waits_for_delayed_activation_to_stabilize(monkeypatch: Any) -> None:
+    engine, factory, ssh, task_id, _host_id, runner = await create_apply_task(True)
+    ssh.activation_states = ["pending", "active"]
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("vps_proxy_manager.tasks.runner.asyncio.sleep", no_wait)
+    await runner._run_one(task_id)
+
+    async with factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None and task.status == TaskStatus.succeeded
+    assert ssh.actions.count("status") == 2
     await engine.dispose()
 
 
@@ -161,14 +196,44 @@ async def test_apply_proxy_leaves_rollback_armed_when_connectivity_fails() -> No
         task = await session.get(Task, task_id)
         state = await Repository(session, runner.secret_box).get_proxy_state(host_id)
         assert task is not None and task.status == TaskStatus.failed
-        assert task.error_code == "proxy_verification_failed"
+        assert task.error_code == "proxy_connectivity_failed"
         diagnostic = await session.scalar(
             select(CodexTask).where(CodexTask.source_task_id == task.id)
         )
         assert diagnostic is not None and diagnostic.operation == "diagnose"
         assert task.result["codex_diagnostic_task_id"] == diagnostic.id
         assert state.mode == ProxyMode.local
-    assert ssh.actions == ["detect", "apply_proxy", "status"]
+    assert ssh.actions == ["upgrade_agent", "detect", "apply_proxy", "status"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_successful_retest_marks_matching_failure_resolved() -> None:
+    engine, factory, ssh, failed_id, host_id, runner = await create_apply_task(False)
+    await runner._run_one(failed_id)
+
+    async with factory() as session:
+        failed = await session.get(Task, failed_id)
+        assert failed is not None
+        retest = await Repository(session, runner.secret_box).create_task(
+            kind=failed.kind,
+            actor_user_id=failed.actor_user_id,
+            host_id=host_id,
+            payload=failed.payload,
+        )
+        await session.commit()
+        retest_id = retest.id
+
+    ssh.connectivity_ok = True
+    await runner._run_one(retest_id)
+
+    async with factory() as session:
+        failed = await session.get(Task, failed_id)
+        retest = await session.get(Task, retest_id)
+        assert failed is not None and retest is not None
+        assert retest.status == TaskStatus.succeeded
+        assert failed.result["resolved_by_task_id"] == retest.id
+        assert f"任务 #{retest.id} 验证解决" in failed.message
     await engine.dispose()
 
 

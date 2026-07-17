@@ -28,7 +28,7 @@ from vps_proxy_manager.proxy.ssrf import fetch_subscription
 from vps_proxy_manager.proxy.tester import LocalProxyTester
 from vps_proxy_manager.services.repository import Repository
 from vps_proxy_manager.ssh.client import SSHClient, SSHError, credentials_from_host
-from vps_proxy_manager.utils.redact import redact_text
+from vps_proxy_manager.utils.redact import redact_obj, redact_text
 
 log = structlog.get_logger()
 
@@ -143,7 +143,12 @@ class TaskRunner:
             try:
                 await self._run_one(task_id)
             except Exception as exc:  # noqa: BLE001
-                log.exception("task_runner_unhandled", task_id=task_id, error=str(exc))
+                log.error(
+                    "task_runner_unhandled",
+                    task_id=task_id,
+                    error_type=type(exc).__name__,
+                    error=redact_text(str(exc)),
+                )
             finally:
                 self.queue.task_done()
 
@@ -238,12 +243,20 @@ class TaskRunner:
                     str(exc),
                     {
                         "exception_type": type(exc).__name__,
-                        "technical_error": redact_text(str(exc))[:1500],
+                        "technical_error": redact_text(
+                            f"{exc}: {exc.detail}" if exc.detail else str(exc)
+                        )[:1500],
                     },
                 )
         except Exception as exc:  # noqa: BLE001
             await session.rollback()
-            log.exception("task_failed", task_id=task_id, kind=task_kind, error=str(exc))
+            log.error(
+                "task_failed",
+                task_id=task_id,
+                kind=task_kind,
+                error_type=type(exc).__name__,
+                error=redact_text(str(exc)),
+            )
             recovered = await session.get(Task, task_id)
             if recovered:
                 await self._finish(
@@ -574,6 +587,13 @@ class TaskRunner:
             "current_display_name": state.current_display_name,
         }
         creds = credentials_from_host(host, repo.decrypt_host_secret(host))
+        upgraded = await self.ssh.run_payload(
+            creds,
+            "upgrade_agent",
+            {},
+            timeout=60,
+        )
+        host.remote_agent_version = str(upgraded.get("agent_version") or "unknown")
         previous_system = host.system_info or {}
         detected = await self.ssh.run_agent(creds, "detect", {}, timeout=30)
         current_system = detected.get("system", {})
@@ -593,15 +613,23 @@ class TaskRunner:
             {"config": config, "rollback_seconds": self.settings.remote_rollback_seconds},
             timeout=360,
         )
-        await self._progress(task.id, 75, "代理已启动，正在确认 SSH 和出口状态")
-        status_result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
+        await self._progress(task.id, 75, "代理启动已调度，正在用新 SSH 连接确认出口状态")
+        status_result = await self._wait_for_proxy_activation(creds)
         status = status_result.get("status", {})
-        if status.get("singbox_active") != "active" or not status.get("connectivity_ok"):
+        if status.get("singbox_active") != "active":
             raise SSHError(
-                "proxy_verification_failed",
-                "代理启动后 SSH 或公网访问验证失败，自动回滚定时器仍有效",
+                "singbox_not_active",
+                "sing-box 启动后未保持运行，自动回滚保护仍有效",
+                detail=str(redact_obj(status)),
+            )
+        if not status.get("connectivity_ok"):
+            raise SSHError(
+                "proxy_connectivity_failed",
+                "sing-box 已运行，但代理公网连通性验证失败，自动回滚保护仍有效",
+                detail=str(redact_obj(status)),
             )
         await self.ssh.run_agent(creds, "confirm_proxy", {}, timeout=30)
+        status["rollback_armed"] = False
         state.mode = ProxyMode.proxy
         state.current_kind = kind
         state.current_vps_node_id = item.id if kind == ResourceKind.node else None
@@ -635,15 +663,25 @@ class TaskRunner:
         repo = Repository(session, self.secret_box)
         host = await repo.get_host(task.host_id or 0)
         creds = credentials_from_host(host, repo.decrypt_host_secret(host))
+        upgraded = await self.ssh.run_payload(creds, "upgrade_agent", {}, timeout=60)
+        host.remote_agent_version = str(upgraded.get("agent_version") or "unknown")
         await self.ssh.run_agent(creds, "restore_proxy", {}, timeout=180)
-        status_result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
+        status_result = await self._wait_for_proxy_activation(creds)
         status = status_result.get("status", {})
-        if status.get("singbox_active") != "active" or not status.get("connectivity_ok"):
+        if status.get("singbox_active") != "active":
             raise SSHError(
-                "proxy_verification_failed",
-                "恢复代理后 SSH 或公网访问验证失败，自动回滚定时器仍有效",
+                "singbox_not_active",
+                "恢复代理后 sing-box 未保持运行，自动回滚保护仍有效",
+                detail=str(redact_obj(status)),
+            )
+        if not status.get("connectivity_ok"):
+            raise SSHError(
+                "proxy_connectivity_failed",
+                "恢复代理后公网连通性验证失败，自动回滚保护仍有效",
+                detail=str(redact_obj(status)),
             )
         await self.ssh.run_agent(creds, "confirm_proxy", {}, timeout=30)
+        status["rollback_armed"] = False
         state = await repo.get_proxy_state(host.id)
         state.mode = ProxyMode.proxy
         host.last_status = {**status, "exit_mode": "proxy"}
@@ -661,6 +699,36 @@ class TaskRunner:
             "上次代理已恢复，SSH 与公网访问验证成功",
             status_result,
         )
+
+    async def _wait_for_proxy_activation(self, creds: Any) -> dict[str, Any]:
+        last_result: dict[str, Any] = {}
+        last_error: SSHError | None = None
+        for attempt in range(8):
+            if attempt:
+                await asyncio.sleep(2)
+            try:
+                last_result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
+                last_error = None
+            except SSHError as exc:
+                last_error = exc
+                if exc.code not in {"ssh_connect_failed", "remote_payload_failed"}:
+                    raise
+                continue
+            status = last_result.get("status", {})
+            activation = status.get("activation_status", {})
+            activation_state = activation.get("state") if isinstance(activation, dict) else None
+            if status.get("singbox_active") == "active" and activation_state in {
+                None,
+                "active",
+            }:
+                return last_result
+            if activation_state in {"failed", "invalid"} or (
+                activation_state != "pending" and not status.get("rollback_armed")
+            ):
+                return last_result
+        if last_error is not None:
+            raise last_error
+        return last_result
 
     async def _rollback_proxy(self, session: AsyncSession, task: Task) -> None:
         repo = Repository(session, self.secret_box)
@@ -940,7 +1008,34 @@ class TaskRunner:
         task.finished_at = datetime.now(UTC)
         if status == TaskStatus.failed:
             await self._queue_codex_diagnostic(session, task)
+        elif status == TaskStatus.succeeded:
+            await self._mark_matching_failures_resolved(session, task)
         await session.commit()
+
+    async def _mark_matching_failures_resolved(self, session: AsyncSession, task: Task) -> None:
+        previous_failures = (
+            await session.scalars(
+                select(Task).where(
+                    Task.id < task.id,
+                    Task.kind == task.kind,
+                    Task.host_id == task.host_id,
+                    Task.status == TaskStatus.failed,
+                )
+            )
+        ).all()
+        for previous in previous_failures:
+            if previous.payload != task.payload or (previous.result or {}).get(
+                "resolved_by_task_id"
+            ):
+                continue
+            previous.result = {
+                **(previous.result or {}),
+                "resolved_by_task_id": task.id,
+                "resolved_at": task.finished_at.isoformat() if task.finished_at else None,
+            }
+            marker = f"已由任务 #{task.id} 验证解决"
+            if marker not in previous.message:
+                previous.message = f"{previous.message}；{marker}"
 
     async def _queue_codex_diagnostic(self, session: AsyncSession, task: Task) -> None:
         if (

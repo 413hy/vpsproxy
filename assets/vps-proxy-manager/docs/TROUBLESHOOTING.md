@@ -86,6 +86,14 @@ sudo nft list ruleset
 
 若代理启动后 SSH 或公网验证失败，保持等待自动回滚，或从控制台执行 `/etc/vps-proxy-manager/rollback-last.sh`。
 
+### sing-box 1.13 报 `detour to an empty direct outbound`
+
+0.3.1 已移除本地 DNS 到空 `direct` 出站的显式 detour。升级控制端后，下一次应用或恢复代理会先自动更新目标 Agent，再生成兼容配置。旧失败任务保留为审计记录；同参数复测成功后会明确显示“已由任务 #X 验证解决”。
+
+### 应用代理等待 360 秒后超时
+
+0.3.1 起不再让启动 TUN 的动作占用原 SSH 命令通道。Agent 先返回，再由公开的 `vpspm-activate.timer/service` 延迟启动；控制端使用全新 SSH 连接验证。管理来源 IP、代理服务器 IP 和私网地址同时加入 sing-box 路由规则与 TUN `route_exclude_address`。失败时 activation 状态、脱敏 FATAL/ERROR 和 systemd 结果会进入自动诊断上下文。
+
 ## 本地出口仍显示代理 IP
 
 1. Telegram 执行 `切回本地出口`。

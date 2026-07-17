@@ -45,7 +45,12 @@ class CodexWorker:
             try:
                 await self._invoke_codex(task_id)
             except Exception as exc:  # noqa: BLE001
-                log.exception("codex_worker_task_failed", task_id=task_id, error=str(exc))
+                log.error(
+                    "codex_worker_task_failed",
+                    task_id=task_id,
+                    error_type=type(exc).__name__,
+                    error=redact_text(str(exc)),
+                )
                 try:
                     await self._fail(
                         task_id,

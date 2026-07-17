@@ -32,6 +32,9 @@ def test_tun_config_bypasses_management_and_proxy_ip() -> None:
     assert "193.218.200.147/32" in cidrs
     assert "203.0.113.10/32" in cidrs
     assert config["route"]["final"] == "proxy"
+    assert "203.0.113.10/32" in config["inbounds"][0]["route_exclude_address"]
+    local_dns = next(server for server in config["dns"]["servers"] if server["tag"] == "local-dns")
+    assert "detour" not in local_dns
 
 
 def test_speedtest_config_uses_mixed_local_inbound() -> None:

@@ -83,8 +83,9 @@ Codex Worker 处理两类记录：
 5. 备份原配置、systemd 单元、service active/enabled 状态以及 route/rule/nft/resolver 快照。
 6. 写独立回滚脚本和 systemd timer。
 7. `sing-box check` 后原子替换配置。
-8. 启动服务，新建 SSH 会话并验证真实 HTTPS 204。
-9. 成功后解除 timer、更新唯一当前出站和配置版本。
+8. 原 SSH 命令返回后，由 `vpspm-activate.timer` 延迟启动 TUN，避免切换动作占用管理通道。
+9. 控制端建立全新 SSH 会话，等待服务稳定，并以出口 IP 请求或 HTTPS 204 任一成功作为公网可用证明。
+10. 成功后解除 rollback timer、更新唯一当前出站和配置版本。
 
 失败时数据库当前出站保持原值。回滚脚本按备份恢复服务状态，因此“旧配置存在但原服务已停止”不会被错误启动。
 
@@ -100,9 +101,14 @@ Agent 使用目标端目录：
 /etc/vps-proxy-manager/backups
 /etc/vps-proxy-manager/original-backup
 /etc/vps-proxy-manager/rollback-last.sh
+/etc/vps-proxy-manager/last-activation.json
 ```
 
+目标端还会公开创建 `vpspm-activate.timer/service` 和 `vpspm-rollback.timer/service`。前者延迟两秒启动并检查 sing-box 是否稳定，后者在控制端未确认时恢复备份；它们都不是隐藏定时任务。
+
 首次初始化备份指针永久保留，用于卸载时恢复初始化前 sing-box 状态。每次切换另存 `last-backup`，用于自动或显式回滚。
+
+成功任务会按 VPS、任务类型和完整参数匹配旧失败任务，并写入 `resolved_by_task_id`。任务历史仍保留失败事实，但 Telegram 会明确链接到验证解决它的成功任务。
 
 ## 当前限制
 

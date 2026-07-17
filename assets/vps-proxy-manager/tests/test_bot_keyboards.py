@@ -58,6 +58,7 @@ def test_finished_task_links_results_and_codex_diagnosis() -> None:
         False,
         result_callback="vse:list:7:0",
         codex_task_id=11,
+        resolved_task_id=12,
     )
     callbacks = {
         button.callback_data
@@ -65,4 +66,4 @@ def test_finished_task_links_results_and_codex_diagnosis() -> None:
         for button in row
         if button.callback_data
     }
-    assert {"vse:list:7:0", "ct:v:11", "t:v:9"} <= callbacks
+    assert {"vse:list:7:0", "ct:v:11", "t:v:9", "t:v:12"} <= callbacks
