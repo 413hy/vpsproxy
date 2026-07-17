@@ -64,6 +64,7 @@ class LocalProxyTester:
                     if samples
                     else None
                 )
+                exit_info = await self._curl_exit(curl, port) if proxy_ok else {}
                 return {
                     **dns_result,
                     **tcp_result,
@@ -74,6 +75,7 @@ class LocalProxyTester:
                     "attempts": self.attempts,
                     "successful_attempts": len(samples),
                     "samples": samples,
+                    **exit_info,
                     "test_url": "https://www.gstatic.com/generate_204",
                     "error": "" if proxy_ok else error or "proxy test failed",
                 }
@@ -154,6 +156,36 @@ class LocalProxyTester:
             }, ""
         except (ValueError, TypeError):
             return None, "curl timing output invalid"
+
+    async def _curl_exit(self, curl: str, port: int) -> dict[str, Any]:
+        process = await asyncio.create_subprocess_exec(
+            curl,
+            "--noproxy",
+            "",
+            "-x",
+            f"http://127.0.0.1:{port}",
+            "-4fsS",
+            "--max-time",
+            "15",
+            "https://ifconfig.co/json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=20)
+            data = json.loads(stdout[:2000]) if process.returncode == 0 else {}
+        except (TimeoutError, ValueError):
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "exit_ip": data.get("ip"),
+            "exit_country": data.get("country"),
+            "exit_country_iso": data.get("country_iso"),
+        }
 
     @staticmethod
     def _free_port() -> int:

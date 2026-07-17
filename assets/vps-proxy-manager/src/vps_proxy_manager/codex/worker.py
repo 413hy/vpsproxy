@@ -503,16 +503,15 @@ class CodexWorker:
                     )
                 else:
                     text = f"Codex 自动诊断 #{task.id} 失败：{task.message}"
-            markup = InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("查看 Codex 诊断", callback_data=f"ct:v:{task_id}")],
-                    [
-                        InlineKeyboardButton(
-                            "查看原任务", callback_data=f"t:v:{task.source_task_id}"
-                        )
-                    ],
-                ]
-            )
+            rows = [
+                [InlineKeyboardButton("查看 Codex 诊断", callback_data=f"ct:v:{task_id}")],
+                [InlineKeyboardButton("查看原任务", callback_data=f"t:v:{task.source_task_id}")],
+            ]
+            if source.host_id:
+                rows.append(
+                    [InlineKeyboardButton("查看此 VPS", callback_data=f"h:v:{source.host_id}")]
+                )
+            markup = InlineKeyboardMarkup(rows)
             async with Bot(self.settings.telegram_bot_token) as bot:
                 for chat_id in targets:
                     if chat_id > 0:

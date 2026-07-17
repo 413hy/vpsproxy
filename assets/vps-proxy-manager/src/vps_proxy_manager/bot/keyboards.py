@@ -545,6 +545,8 @@ def task_detail(
     result_callback: str | None = None,
     codex_task_id: int | None = None,
     resolved_task_id: int | None = None,
+    return_callback: str | None = None,
+    return_label: str = "返回对应页面",
 ) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("刷新", callback_data=f"t:v:{task_id}")]]
     if result_callback:
@@ -564,6 +566,8 @@ def task_detail(
         )
     if active:
         rows.append([InlineKeyboardButton("取消任务", callback_data=f"t:cancel:{task_id}")])
+    if return_callback:
+        rows.append([InlineKeyboardButton(return_label, callback_data=return_callback)])
     rows.append([InlineKeyboardButton("返回任务中心", callback_data="t:list")])
     return InlineKeyboardMarkup(rows)
 

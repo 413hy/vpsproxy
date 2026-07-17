@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -26,6 +27,7 @@ from vps_proxy_manager.proxy.parser import ProxyNodeSpec, parse_node_blob, parse
 from vps_proxy_manager.proxy.singbox import build_speedtest_config, build_tun_config
 from vps_proxy_manager.proxy.ssrf import fetch_subscription
 from vps_proxy_manager.proxy.tester import LocalProxyTester
+from vps_proxy_manager.remote.payload import AGENT_VERSION
 from vps_proxy_manager.services.repository import Repository
 from vps_proxy_manager.ssh.client import SSHClient, SSHError, credentials_from_host
 from vps_proxy_manager.utils.redact import redact_obj, redact_text
@@ -83,14 +85,27 @@ class TaskRunner:
         self._queued_ids: set[int] = set()
         self._host_locks: dict[int, asyncio.Lock] = {}
         self._worker: asyncio.Task[None] | None = None
+        self._monitor_worker: asyncio.Task[None] | None = None
+        self._monitor_failures: dict[int, tuple[str, int]] = {}
 
     async def start(self) -> None:
         if self._worker is not None:
             return
         await self._recover_tasks()
         self._worker = asyncio.create_task(self._work(), name="vpspm-task-runner")
+        if self.settings.monitor_enabled:
+            self._monitor_worker = asyncio.create_task(
+                self._monitor_loop(), name="vpspm-consistency-monitor"
+            )
 
     async def stop(self) -> None:
+        if self._monitor_worker:
+            self._monitor_worker.cancel()
+            try:
+                await self._monitor_worker
+            except asyncio.CancelledError:
+                pass
+            self._monitor_worker = None
         if self._worker:
             self._worker.cancel()
             try:
@@ -151,6 +166,200 @@ class TaskRunner:
                 )
             finally:
                 self.queue.task_done()
+
+    async def _monitor_loop(self) -> None:
+        await asyncio.sleep(self.settings.monitor_interval_seconds)
+        while True:
+            try:
+                async with self.session_factory() as session:
+                    host_ids = [
+                        host.id for host in await Repository(session, self.secret_box).list_hosts()
+                    ]
+                for host_id in host_ids:
+                    try:
+                        await self._monitor_host(host_id)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error(
+                            "consistency_host_check_failed",
+                            host_id=host_id,
+                            error_type=type(exc).__name__,
+                            error=redact_text(str(exc)),
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.error(
+                    "consistency_monitor_failed",
+                    error_type=type(exc).__name__,
+                    error=redact_text(str(exc)),
+                )
+            await asyncio.sleep(self.settings.monitor_interval_seconds)
+
+    async def _monitor_host(self, host_id: int) -> None:
+        async with self.session_factory() as session:
+            active_network_task = await session.scalar(
+                select(Task.id).where(
+                    Task.host_id == host_id,
+                    Task.kind.in_(NETWORK_MUTATING),
+                    Task.status.in_(
+                        [TaskStatus.queued, TaskStatus.running, TaskStatus.cancel_requested]
+                    ),
+                )
+            )
+            if active_network_task:
+                return
+            repo = Repository(session, self.secret_box)
+            host = await repo.get_host(host_id)
+            state = await repo.get_proxy_state(host_id)
+            expected_selection = await self._selection_for_state(repo, state)
+            expected_mode = state.mode
+            creds = credentials_from_host(host, repo.decrypt_host_secret(host))
+            known_agent_version = host.remote_agent_version
+
+        try:
+            if known_agent_version != AGENT_VERSION:
+                upgraded = await self.ssh.run_payload(creds, "upgrade_agent", {}, timeout=60)
+                known_agent_version = str(upgraded.get("agent_version") or "unknown")
+            result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
+            status = result.get("status", {})
+            if not isinstance(status, dict):
+                status = {}
+            issues = self._consistency_issues(expected_mode, expected_selection, status)
+        except SSHError as exc:
+            status = {}
+            issues = [f"远端巡检失败：{exc.code}"]
+
+        async with self.session_factory() as session:
+            repo = Repository(session, self.secret_box)
+            host = await repo.get_host(host_id)
+            if status:
+                status["exit_mode"] = expected_mode.value
+                host.last_status = status
+                host.remote_agent_version = str(
+                    status.get("agent_version") or known_agent_version or "unknown"
+                )
+            await session.commit()
+
+        if not issues:
+            self._monitor_failures.pop(host_id, None)
+            await self._mark_monitor_recovered(host_id)
+            return
+        signature = "|".join(issues)
+        old_signature, old_count = self._monitor_failures.get(host_id, ("", 0))
+        count = old_count + 1 if old_signature == signature else 1
+        self._monitor_failures[host_id] = (signature, count)
+        if count < self.settings.monitor_failure_threshold:
+            return
+        await self._record_monitor_failure(
+            host_id,
+            issues,
+            expected_mode,
+            expected_selection,
+            status,
+        )
+
+    @staticmethod
+    def _consistency_issues(
+        expected_mode: ProxyMode,
+        expected_selection: dict[str, Any] | None,
+        status: dict[str, Any],
+    ) -> list[str]:
+        service_active = status.get("singbox_active") == "active"
+        if expected_mode == ProxyMode.proxy:
+            issues = []
+            if not service_active:
+                issues.append("数据库期望代理出口，但 sing-box 未运行")
+            if service_active and not status.get("config_consistent"):
+                issues.append("磁盘配置与运行进程标识不一致")
+            active_config = status.get("active_config", {})
+            actual_selection = (
+                active_config.get("selection") if isinstance(active_config, dict) else None
+            )
+            if expected_selection != actual_selection:
+                issues.append("数据库选中资源与远端已加载资源不一致")
+            if service_active and not status.get("connectivity_ok"):
+                issues.append("代理服务运行但公网探测失败")
+            return issues
+        if expected_mode in {ProxyMode.local, ProxyMode.uninstalled} and service_active:
+            return ["数据库期望本地出口，但 sing-box 仍在运行"]
+        if expected_mode == ProxyMode.uninstalled and status.get("managed_library_exists"):
+            return ["数据库标记已卸载，但远端管理资源仍存在"]
+        return []
+
+    async def _record_monitor_failure(
+        self,
+        host_id: int,
+        issues: list[str],
+        expected_mode: ProxyMode,
+        expected_selection: dict[str, Any] | None,
+        status: dict[str, Any],
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self.session_factory() as session:
+            latest = await session.scalar(
+                select(Task)
+                .where(Task.host_id == host_id, Task.kind == TaskKind.consistency_check)
+                .order_by(Task.created_at.desc())
+                .limit(1)
+            )
+            if latest is not None:
+                created_at = latest.created_at
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=UTC)
+                if now - created_at < timedelta(
+                    seconds=self.settings.monitor_alert_cooldown_seconds
+                ):
+                    return
+            repo = Repository(session, self.secret_box)
+            task = await repo.create_task(
+                kind=TaskKind.consistency_check,
+                actor_user_id=0,
+                host_id=host_id,
+                payload={"monitor": True},
+            )
+            task.status = TaskStatus.running
+            task.started_at = now
+            task.progress = 90
+            await self._finish(
+                session,
+                task,
+                TaskStatus.failed,
+                "proxy_state_mismatch",
+                "一致性监测发现控制端与目标 VPS 状态不同步",
+                {
+                    "issues": issues,
+                    "expected_mode": expected_mode.value,
+                    "expected_selection": expected_selection,
+                    "actual": {
+                        "singbox_active": status.get("singbox_active"),
+                        "config_consistent": status.get("config_consistent"),
+                        "active_config": status.get("active_config"),
+                        "connectivity_ok": status.get("connectivity_ok"),
+                    },
+                },
+            )
+
+    async def _mark_monitor_recovered(self, host_id: int) -> None:
+        async with self.session_factory() as session:
+            latest = await session.scalar(
+                select(Task)
+                .where(
+                    Task.host_id == host_id,
+                    Task.kind == TaskKind.consistency_check,
+                    Task.status == TaskStatus.failed,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(1)
+            )
+            if latest is None or (latest.result or {}).get("monitor_recovered_at"):
+                return
+            latest.result = {
+                **(latest.result or {}),
+                "monitor_recovered_at": datetime.now(UTC).isoformat(),
+            }
+            if "后续巡检已恢复一致" not in latest.message:
+                latest.message = f"{latest.message}；后续巡检已恢复一致"
+            await session.commit()
 
     async def _run_one(self, task_id: int) -> None:
         async with self.session_factory() as session:
@@ -295,14 +504,26 @@ class TaskRunner:
         status = result.get("status", {})
         state = await repo.get_proxy_state(host.id)
         if isinstance(status, dict):
-            service = status.get("singbox_active")
-            if status.get("managed_library_exists") is False:
-                state.mode = ProxyMode.uninstalled
-            else:
-                state.mode = ProxyMode.proxy if service == "active" else ProxyMode.local
+            expected_selection = await self._selection_for_state(repo, state)
+            issues = self._consistency_issues(state.mode, expected_selection, status)
             status["exit_mode"] = state.mode.value
             host.last_status = status
             host.remote_agent_version = status.get("agent_version") or host.remote_agent_version
+            if issues:
+                await session.commit()
+                raise SSHError(
+                    "proxy_state_mismatch",
+                    "状态已读取，但控制端与目标 VPS 不一致：" + "；".join(issues),
+                    detail=str(
+                        redact_obj(
+                            {
+                                "expected_mode": state.mode.value,
+                                "expected_selection": expected_selection,
+                                "active_config": status.get("active_config"),
+                            }
+                        )
+                    ),
+                )
         await repo.audit(
             actor_user_id=task.actor_user_id, action="status", result="ok", host_id=host.id
         )
@@ -558,6 +779,7 @@ class TaskRunner:
     async def _apply_proxy(self, session: AsyncSession, task: Task) -> None:
         repo = Repository(session, self.secret_box)
         host = await repo.get_host(task.host_id or 0)
+        previous_exit = self._exit_info(host.last_status or {})
         state = await repo.get_proxy_state(host.id)
         item: VpsNode | VpsSubscriptionEntry
         if task.payload.get("vps_node_id"):
@@ -567,6 +789,11 @@ class TaskRunner:
             kind = ResourceKind.node
             subscription_id = None
             fingerprint = None
+            selection = {
+                "kind": ResourceKind.node.value,
+                "resource_id": item.id,
+                "fingerprint": item.fingerprint,
+            }
         else:
             item = await repo.get_vps_subscription_entry(
                 int(task.payload["vps_subscription_entry_id"])
@@ -577,6 +804,11 @@ class TaskRunner:
             kind = ResourceKind.subscription
             subscription_id = sub.id
             fingerprint = item.fingerprint
+            selection = {
+                "kind": ResourceKind.subscription.value,
+                "resource_id": sub.id,
+                "fingerprint": item.fingerprint,
+            }
         spec = parse_node_blob(repo.decrypt_node_link(item))
         previous_state = {
             "mode": state.mode.value,
@@ -610,7 +842,11 @@ class TaskRunner:
         result = await self.ssh.run_agent(
             creds,
             "apply_proxy",
-            {"config": config, "rollback_seconds": self.settings.remote_rollback_seconds},
+            {
+                "config": config,
+                "selection": selection,
+                "rollback_seconds": self.settings.remote_rollback_seconds,
+            },
             timeout=360,
         )
         await self._progress(task.id, 75, "代理启动已调度，正在用新 SSH 连接确认出口状态")
@@ -627,6 +863,26 @@ class TaskRunner:
                 "proxy_connectivity_failed",
                 "sing-box 已运行，但代理公网连通性验证失败，自动回滚保护仍有效",
                 detail=str(redact_obj(status)),
+            )
+        active_config = status.get("active_config", {})
+        if (
+            not status.get("config_consistent")
+            or not isinstance(active_config, dict)
+            or active_config.get("config_sha256") != result.get("config_sha256")
+            or active_config.get("selection") != selection
+        ):
+            raise SSHError(
+                "proxy_selection_mismatch",
+                "sing-box 已联网，但实际加载的配置与所选节点不一致，自动回滚保护仍有效",
+                detail=str(
+                    redact_obj(
+                        {
+                            "expected_selection": selection,
+                            "expected_sha256": result.get("config_sha256"),
+                            "active_config": active_config,
+                        }
+                    )
+                ),
             )
         await self.ssh.run_agent(creds, "confirm_proxy", {}, timeout=30)
         status["rollback_armed"] = False
@@ -646,16 +902,36 @@ class TaskRunner:
             host_id=host.id,
             detail={"kind": kind.value, "name": item.name},
         )
+        exit_info = self._exit_info(status)
+        exit_changed = bool(
+            exit_info.get("ip")
+            and previous_exit.get("ip")
+            and exit_info["ip"] != previous_exit["ip"]
+        )
+        exit_text = exit_info.get("ip") or "未知"
+        if exit_info.get("country_iso"):
+            exit_text += f" ({exit_info['country_iso']})"
+        same_exit_note = (
+            "；出口 IP 与切换前相同，但所选资源与已加载配置哈希均已更新，节点可能共享落地出口"
+            if exit_info.get("ip")
+            and previous_exit.get("ip") == exit_info.get("ip")
+            and previous_state.get("current_display_name") != item.name
+            else ""
+        )
         await self._finish(
             session,
             task,
             TaskStatus.succeeded,
             None,
-            "代理已应用，SSH 连通性确认成功，自动回滚保护已解除",
+            f"已切换到 {item.name}；实际出口 {exit_text}，配置与运行进程已核对一致{same_exit_note}",
             {
                 "backup": result.get("backup"),
                 "status": status,
                 "previous_state": previous_state,
+                "selection": selection,
+                "exit": exit_info,
+                "previous_exit": previous_exit,
+                "exit_changed": exit_changed,
             },
         )
 
@@ -665,7 +941,14 @@ class TaskRunner:
         creds = credentials_from_host(host, repo.decrypt_host_secret(host))
         upgraded = await self.ssh.run_payload(creds, "upgrade_agent", {}, timeout=60)
         host.remote_agent_version = str(upgraded.get("agent_version") or "unknown")
-        await self.ssh.run_agent(creds, "restore_proxy", {}, timeout=180)
+        state = await repo.get_proxy_state(host.id)
+        selection = await self._selection_for_state(repo, state)
+        await self.ssh.run_agent(
+            creds,
+            "restore_proxy",
+            {"selection": selection} if selection else {},
+            timeout=180,
+        )
         status_result = await self._wait_for_proxy_activation(creds)
         status = status_result.get("status", {})
         if status.get("singbox_active") != "active":
@@ -680,9 +963,17 @@ class TaskRunner:
                 "恢复代理后公网连通性验证失败，自动回滚保护仍有效",
                 detail=str(redact_obj(status)),
             )
+        if selection and (
+            not status.get("config_consistent")
+            or status.get("active_config", {}).get("selection") != selection
+        ):
+            raise SSHError(
+                "proxy_selection_mismatch",
+                "恢复后的运行配置与上次选中节点不一致，自动回滚保护仍有效",
+                detail=str(redact_obj(status.get("active_config", {}))),
+            )
         await self.ssh.run_agent(creds, "confirm_proxy", {}, timeout=30)
         status["rollback_armed"] = False
-        state = await repo.get_proxy_state(host.id)
         state.mode = ProxyMode.proxy
         host.last_status = {**status, "exit_mode": "proxy"}
         await repo.audit(
@@ -699,6 +990,42 @@ class TaskRunner:
             "上次代理已恢复，SSH 与公网访问验证成功",
             status_result,
         )
+
+    async def _selection_for_state(self, repo: Repository, state: Any) -> dict[str, Any] | None:
+        if state.current_kind == ResourceKind.node and state.current_vps_node_id:
+            item = await repo.get_vps_node(state.current_vps_node_id)
+            return {
+                "kind": ResourceKind.node.value,
+                "resource_id": item.id,
+                "fingerprint": item.fingerprint,
+            }
+        if (
+            state.current_kind == ResourceKind.subscription
+            and state.current_vps_subscription_id
+            and state.current_entry_fingerprint
+        ):
+            return {
+                "kind": ResourceKind.subscription.value,
+                "resource_id": state.current_vps_subscription_id,
+                "fingerprint": state.current_entry_fingerprint,
+            }
+        return None
+
+    @staticmethod
+    def _exit_info(status: dict[str, Any]) -> dict[str, Any]:
+        probe = status.get("outbound_probe")
+        if isinstance(probe, str):
+            try:
+                probe = json.loads(probe)
+            except ValueError:
+                probe = {}
+        if not isinstance(probe, dict):
+            probe = {}
+        return {
+            key: probe.get(key)
+            for key in ("ip", "country", "country_iso", "asn", "asn_org")
+            if probe.get(key) is not None
+        }
 
     async def _wait_for_proxy_activation(self, creds: Any) -> dict[str, Any]:
         last_result: dict[str, Any] = {}
@@ -734,9 +1061,6 @@ class TaskRunner:
         repo = Repository(session, self.secret_box)
         host = await repo.get_host(task.host_id or 0)
         creds = credentials_from_host(host, repo.decrypt_host_secret(host))
-        result = await self.ssh.run_agent(creds, "rollback", {}, timeout=180)
-        status_result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
-        status = status_result.get("status", {})
         previous_task = await session.scalar(
             select(Task)
             .where(
@@ -747,8 +1071,36 @@ class TaskRunner:
             .order_by(Task.finished_at.desc())
             .limit(1)
         )
-        state = await repo.get_proxy_state(host.id)
         previous = previous_task.result.get("previous_state", {}) if previous_task else {}
+        rollback_selection: dict[str, Any] | None = None
+        if previous.get("current_kind") == ResourceKind.node.value and previous.get(
+            "current_vps_node_id"
+        ):
+            item = await repo.get_vps_node(int(previous["current_vps_node_id"]))
+            rollback_selection = {
+                "kind": ResourceKind.node.value,
+                "resource_id": item.id,
+                "fingerprint": item.fingerprint,
+            }
+        elif (
+            previous.get("current_kind") == ResourceKind.subscription.value
+            and previous.get("current_vps_subscription_id")
+            and previous.get("current_entry_fingerprint")
+        ):
+            rollback_selection = {
+                "kind": ResourceKind.subscription.value,
+                "resource_id": int(previous["current_vps_subscription_id"]),
+                "fingerprint": str(previous["current_entry_fingerprint"]),
+            }
+        result = await self.ssh.run_agent(
+            creds,
+            "rollback",
+            {"selection": rollback_selection} if rollback_selection else {},
+            timeout=180,
+        )
+        status_result = await self.ssh.run_agent(creds, "status", {}, timeout=45)
+        status = status_result.get("status", {})
+        state = await repo.get_proxy_state(host.id)
         if previous:
             state.mode = ProxyMode(previous.get("mode", ProxyMode.local.value))
             kind_value = previous.get("current_kind")
@@ -760,6 +1112,13 @@ class TaskRunner:
         else:
             state.mode = (
                 ProxyMode.proxy if status.get("singbox_active") == "active" else ProxyMode.local
+            )
+        issues = self._consistency_issues(state.mode, rollback_selection, status)
+        if issues:
+            raise SSHError(
+                "rollback_state_mismatch",
+                "回滚已执行，但恢复后的运行状态不一致：" + "；".join(issues),
+                detail=str(redact_obj(status.get("active_config", {}))),
             )
         host.last_status = {**status, "exit_mode": state.mode.value}
         await repo.audit(

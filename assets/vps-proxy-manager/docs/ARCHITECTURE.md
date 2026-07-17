@@ -22,6 +22,8 @@ sing-box TUN + systemd rollback timer
 
 `python-telegram-bot` 使用单线程 update 顺序处理和异步长任务，避免 ConversationHandler 状态竞争。TaskRunner 内部不阻塞 Bot 轮询；任务进度写数据库，Bot 通过编辑同一条状态消息展示。
 
+TaskRunner 内含一致性巡检协程。它避开正在执行网络修改的 VPS，核对数据库期望出口、远端活动配置 SHA-256、资源指纹、服务状态和公网探测。连续失败达到阈值后创建 `consistency_check` 失败任务，并由 Codex Worker 自动执行只读诊断；未经管理员确认不会自动重放切换、回滚或卸载。
+
 ## 数据域
 
 ### 控制端单节点
@@ -83,9 +85,9 @@ Codex Worker 处理两类记录：
 5. 备份原配置、systemd 单元、service active/enabled 状态以及 route/rule/nft/resolver 快照。
 6. 写独立回滚脚本和 systemd timer。
 7. `sing-box check` 后原子替换配置。
-8. 原 SSH 命令返回后，由 `vpspm-activate.timer` 延迟启动 TUN，避免切换动作占用管理通道。
-9. 控制端建立全新 SSH 会话，等待服务稳定，并以出口 IP 请求或 HTTPS 204 任一成功作为公网可用证明。
-10. 成功后解除 rollback timer、更新唯一当前出站和配置版本。
+8. 原 SSH 命令返回后，由 `vpspm-activate.timer` 延迟重启 TUN；使用 `restart` 保证已有 sing-box 进程也加载新文件。
+9. Agent 仅在进程稳定后把 `pending-config.json` 的 SHA-256 和资源指纹提升到 `active-config.json`。
+10. 控制端建立全新 SSH 会话，核对活动哈希、资源指纹、服务状态和公网探测，全部成功后才解除 rollback timer 并更新数据库。
 
 失败时数据库当前出站保持原值。回滚脚本按备份恢复服务状态，因此“旧配置存在但原服务已停止”不会被错误启动。
 
@@ -102,6 +104,8 @@ Agent 使用目标端目录：
 /etc/vps-proxy-manager/original-backup
 /etc/vps-proxy-manager/rollback-last.sh
 /etc/vps-proxy-manager/last-activation.json
+/etc/vps-proxy-manager/pending-config.json
+/etc/vps-proxy-manager/active-config.json
 ```
 
 目标端还会公开创建 `vpspm-activate.timer/service` 和 `vpspm-rollback.timer/service`。前者延迟两秒启动并检查 sing-box 是否稳定，后者在控制端未确认时恢复备份；它们都不是隐藏定时任务。

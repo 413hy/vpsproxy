@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     subscription_max_redirects: int = 3
     speedtest_concurrency: int = 3
     remote_rollback_seconds: int = 120
+    monitor_enabled: bool = True
+    monitor_interval_seconds: int = Field(default=60, ge=30, le=3600)
+    monitor_failure_threshold: int = Field(default=2, ge=1, le=5)
+    monitor_alert_cooldown_seconds: int = Field(default=1800, ge=300, le=86400)
     codex_enabled: bool = True
     codex_cli: str = "codex"
     codex_home: Path = Path("/root/.codex")
@@ -37,7 +41,7 @@ class Settings(BaseSettings):
     codex_poll_seconds: int = 3
     codex_timeout_seconds: int = 900
     codex_model: str = "gpt-5.6-sol"
-    codex_reasoning_effort: str = "xhigh"
+    codex_reasoning_effort: str = "high"
 
     @field_validator("admin_user_ids", "allowed_chat_ids", mode="before")
     @classmethod

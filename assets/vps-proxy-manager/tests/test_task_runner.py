@@ -26,18 +26,24 @@ from vps_proxy_manager.tasks.runner import TaskRunner
 
 class FakeSSH:
     def __init__(
-        self, *, connectivity_ok: bool = True, activation_states: list[str] | None = None
+        self,
+        *,
+        connectivity_ok: bool = True,
+        config_consistent: bool = True,
+        activation_states: list[str] | None = None,
     ) -> None:
         self.connectivity_ok = connectivity_ok
+        self.config_consistent = config_consistent
         self.activation_states = list(activation_states or [])
         self.actions: list[str] = []
+        self.selection: dict[str, Any] | None = None
 
     async def run_payload(
         self, _creds: object, action: str, _data: dict[str, Any], *, timeout: int
     ) -> dict[str, Any]:
         self.actions.append(action)
         assert action == "upgrade_agent"
-        return {"agent_version": "0.3.1"}
+        return {"agent_version": "0.3.2"}
 
     async def run_agent(
         self, _creds: object, action: str, _data: dict[str, Any], *, timeout: int
@@ -51,13 +57,23 @@ class FakeSSH:
                 }
             }
         if action == "apply_proxy":
-            return {"backup": "/safe/backup", "rollback_armed": True}
+            self.selection = _data["selection"]
+            return {
+                "backup": "/safe/backup",
+                "rollback_armed": True,
+                "config_sha256": "a" * 64,
+            }
         if action == "status":
             activation_state = self.activation_states.pop(0) if self.activation_states else None
             return {
                 "status": {
                     "singbox_active": "active",
                     "connectivity_ok": self.connectivity_ok,
+                    "config_consistent": self.config_consistent,
+                    "active_config": {
+                        "config_sha256": "a" * 64,
+                        "selection": self.selection,
+                    },
                     **(
                         {"activation_status": {"state": activation_state}}
                         if activation_state
@@ -204,6 +220,81 @@ async def test_apply_proxy_leaves_rollback_armed_when_connectivity_fails() -> No
         assert task.result["codex_diagnostic_task_id"] == diagnostic.id
         assert state.mode == ProxyMode.local
     assert ssh.actions == ["upgrade_agent", "detect", "apply_proxy", "status"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_apply_proxy_rejects_running_process_with_stale_config() -> None:
+    engine, factory, ssh, task_id, _host_id, runner = await create_apply_task(True)
+    ssh.config_consistent = False
+
+    await runner._run_one(task_id)
+
+    async with factory() as session:
+        task = await session.get(Task, task_id)
+        assert task is not None and task.status == TaskStatus.failed
+        assert task.error_code == "proxy_selection_mismatch"
+    assert "confirm_proxy" not in ssh.actions
+    await engine.dispose()
+
+
+def test_consistency_monitor_detects_selection_mismatch() -> None:
+    expected = {"kind": "node", "resource_id": 1, "fingerprint": "a" * 64}
+    issues = TaskRunner._consistency_issues(
+        ProxyMode.proxy,
+        expected,
+        {
+            "singbox_active": "active",
+            "config_consistent": True,
+            "connectivity_ok": True,
+            "active_config": {
+                "config_sha256": "b" * 64,
+                "selection": {**expected, "resource_id": 2},
+            },
+        },
+    )
+
+    assert "数据库选中资源与远端已加载资源不一致" in issues
+
+
+@pytest.mark.asyncio
+async def test_consistency_monitor_queues_codex_diagnosis() -> None:
+    engine = create_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = create_sessionmaker(engine)
+    key = generate_key()
+    secret_box = SecretBox(key)
+    async with factory() as session:
+        host = await Repository(session, secret_box).add_host(
+            name="monitored",
+            host="203.0.113.30",
+            port=22,
+            username="root",
+            auth_method=AuthMethod.password,
+            secret="test-only",  # noqa: S106
+            known_host="known-host",
+        )
+        await session.commit()
+        host_id = host.id
+    runner = TaskRunner(factory, settings(key), secret_box, ssh_client=FakeSSH())
+
+    await runner._record_monitor_failure(
+        host_id,
+        ["数据库期望本地出口，但 sing-box 仍在运行"],
+        ProxyMode.local,
+        None,
+        {"singbox_active": "active", "connectivity_ok": True},
+    )
+
+    async with factory() as session:
+        task = await session.scalar(select(Task).where(Task.kind == TaskKind.consistency_check))
+        assert task is not None and task.status == TaskStatus.failed
+        assert task.error_code == "proxy_state_mismatch"
+        diagnostic = await session.scalar(
+            select(CodexTask).where(CodexTask.source_task_id == task.id)
+        )
+        assert diagnostic is not None and diagnostic.operation == "diagnose"
     await engine.dispose()
 
 

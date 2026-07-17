@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -16,7 +17,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-AGENT_VERSION = "0.3.1"
+AGENT_VERSION = "0.3.2"
 BASE = Path("/etc/vps-proxy-manager")
 BACKUPS = BASE / "backups"
 LIBRARY = BASE / "library"
@@ -27,6 +28,8 @@ ROLLBACK_SCRIPT = BASE / "rollback-last.sh"
 ROLLBACK_SERVICE = Path("/etc/systemd/system/vpspm-rollback.service")
 ROLLBACK_TIMER = Path("/etc/systemd/system/vpspm-rollback.timer")
 ACTIVATION_STATUS = BASE / "last-activation.json"
+PENDING_CONFIG = BASE / "pending-config.json"
+ACTIVE_CONFIG = BASE / "active-config.json"
 ACTIVATION_SERVICE = Path("/etc/systemd/system/vpspm-activate.service")
 ACTIVATION_TIMER = Path("/etc/systemd/system/vpspm-activate.timer")
 AGENT_SOURCE = Path("/usr/local/lib/vpspm-agent/agent.py")
@@ -123,6 +126,8 @@ def backup_state() -> Path:
         shutil.copy2(SINGBOX_CONFIG, dest / "config.json")
     if LOCAL_SINGBOX_SERVICE.exists() and not LOCAL_SINGBOX_SERVICE.is_symlink():
         shutil.copy2(LOCAL_SINGBOX_SERVICE, dest / "sing-box.service")
+    if ACTIVE_CONFIG.exists() and not ACTIVE_CONFIG.is_symlink():
+        shutil.copy2(ACTIVE_CONFIG, dest / "active-config.json")
     resolv_conf = Path("/etc/resolv.conf")
     if resolv_conf.exists() and not resolv_conf.is_symlink():
         shutil.copy2(resolv_conf, dest / "resolv.conf")
@@ -181,6 +186,13 @@ def restore_backup(backup: Path) -> None:
         LOCAL_SINGBOX_SERVICE.chmod(0o644)
     else:
         LOCAL_SINGBOX_SERVICE.unlink(missing_ok=True)
+    saved_active_config = backup / "active-config.json"
+    if saved_active_config.exists():
+        shutil.copy2(saved_active_config, ACTIVE_CONFIG)
+        ACTIVE_CONFIG.chmod(0o600)
+    else:
+        ACTIVE_CONFIG.unlink(missing_ok=True)
+    PENDING_CONFIG.unlink(missing_ok=True)
     run(["systemctl", "daemon-reload"], check=False)
     if (backup / "service-enabled").exists():
         run(["systemctl", "enable", "sing-box.service"], check=False)
@@ -321,6 +333,70 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def config_sha256() -> str | None:
+    if not SINGBOX_CONFIG.is_file() or SINGBOX_CONFIG.is_symlink():
+        return None
+    return hashlib.sha256(SINGBOX_CONFIG.read_bytes()).hexdigest()
+
+
+def read_marker(path: Path) -> dict[str, Any]:
+    if not path.is_file() or path.is_symlink():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def validate_selection(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        fail("bad_request", "缺少代理资源标识")
+    kind = str(value.get("kind") or "")
+    if kind not in {"node", "subscription"}:
+        fail("bad_request", "代理资源类型无效")
+    try:
+        resource_id = int(value.get("resource_id"))
+    except (TypeError, ValueError):
+        fail("bad_request", "代理资源 ID 无效")
+    fingerprint = str(value.get("fingerprint") or "")
+    if resource_id < 1 or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        fail("bad_request", "代理资源标识无效")
+    return {"kind": kind, "resource_id": resource_id, "fingerprint": fingerprint}
+
+
+def stage_config(selection: dict[str, Any] | None = None) -> dict[str, Any]:
+    digest = config_sha256()
+    if digest is None:
+        fail("proxy_config_missing", "没有可加载的代理配置")
+    if selection is None:
+        current = read_marker(ACTIVE_CONFIG)
+        raw_selection = current.get("selection")
+        selection = validate_selection(raw_selection) if raw_selection else None
+    marker = {
+        "config_sha256": digest,
+        "selection": selection,
+        "staged_at": int(time.time()),
+    }
+    atomic_write(PENDING_CONFIG, json.dumps(marker, ensure_ascii=False), 0o600)
+    return marker
+
+
+def promote_staged_config() -> dict[str, Any]:
+    pending = read_marker(PENDING_CONFIG)
+    digest = config_sha256()
+    if not pending or digest is None or pending.get("config_sha256") != digest:
+        fail("active_config_mismatch", "sing-box 已启动，但加载配置标识不一致")
+    active = {
+        "config_sha256": digest,
+        "selection": pending.get("selection"),
+        "activated_at": int(time.time()),
+    }
+    atomic_write(ACTIVE_CONFIG, json.dumps(active, ensure_ascii=False), 0o600)
+    PENDING_CONFIG.unlink(missing_ok=True)
+    return active
 
 
 def library_id(data: dict[str, Any]) -> str:
@@ -522,6 +598,12 @@ if [ -f "{backup}/sing-box.service" ]; then
 else
   rm -f /etc/systemd/system/sing-box.service
 fi
+if [ -f "{backup}/active-config.json" ]; then
+  install -m 600 "{backup}/active-config.json" "{ACTIVE_CONFIG}"
+else
+  rm -f "{ACTIVE_CONFIG}"
+fi
+rm -f "{PENDING_CONFIG}"
 systemctl daemon-reload 2>/dev/null || true
 if [ -f "{backup}/service-enabled" ]; then
   systemctl enable sing-box.service 2>/dev/null || true
@@ -650,7 +732,7 @@ def schedule_activation() -> None:
 
 def activate_proxy() -> None:
     disarm_activation()
-    started = run(["systemctl", "start", "sing-box.service"], check=False, timeout=90)
+    started = run(["systemctl", "restart", "sing-box.service"], check=False, timeout=90)
     if started.returncode != 0 or not wait_for_stable_service():
         detail = service_snapshot()
         detail["error"] = recent_service_error()
@@ -661,9 +743,13 @@ def activate_proxy() -> None:
         )
         run([str(ROLLBACK_SCRIPT)], check=False)
         fail("singbox_start_failed", "sing-box 启动后未能保持运行，已自动回滚")
+    active_config = promote_staged_config()
     atomic_write(
         ACTIVATION_STATUS,
-        json.dumps({"state": "active", "detail": service_snapshot()}, ensure_ascii=False),
+        json.dumps(
+            {"state": "active", "detail": service_snapshot(), "active_config": active_config},
+            ensure_ascii=False,
+        ),
         0o600,
     )
     ok({"activated": True})
@@ -726,6 +812,7 @@ def apply_proxy() -> None:
     config = data.get("config")
     if not isinstance(config, dict):
         fail("bad_request", "缺少 sing-box 配置")
+    selection = validate_selection(data.get("selection"))
     add_proxy_server_bypass(config)
     rollback_seconds = max(60, min(int(data.get("rollback_seconds") or 120), 600))
     ensure_layout()
@@ -746,6 +833,7 @@ def apply_proxy() -> None:
         SINGBOX_CONFIG.chmod(0o600)
     finally:
         tmp.unlink(missing_ok=True)
+    staged = stage_config(selection)
     arm_rollback(rollback_seconds)
     enabled = run(["systemctl", "enable", "sing-box.service"], check=False, timeout=60)
     if enabled.returncode != 0:
@@ -757,6 +845,8 @@ def apply_proxy() -> None:
             "backup": str(backup),
             "rollback_armed": True,
             "activation_scheduled": True,
+            "config_sha256": staged["config_sha256"],
+            "selection": selection,
             "agent_version": AGENT_VERSION,
         }
     )
@@ -769,6 +859,7 @@ def confirm_proxy() -> None:
 
 
 def rollback() -> None:
+    data = read_input()
     if not ROLLBACK_SCRIPT.exists():
         fail("no_backup", "没有可用回滚脚本")
     result = run([str(ROLLBACK_SCRIPT)], check=False)
@@ -781,7 +872,13 @@ def rollback() -> None:
     )
     backup = Path((BASE / "last-backup").read_text(encoding="utf-8").strip())
     mode = "proxy" if (backup / "service-active").exists() else "local"
-    ok({"rolled_back": True, "exit_mode": mode})
+    active_config: dict[str, Any] = {}
+    if mode == "proxy" and data.get("selection"):
+        staged = stage_config(validate_selection(data.get("selection")))
+        active_config = promote_staged_config()
+        if active_config.get("config_sha256") != staged.get("config_sha256"):
+            fail("rollback_config_mismatch", "回滚后的活动配置标识不一致")
+    ok({"rolled_back": True, "exit_mode": mode, "active_config": active_config})
 
 
 def stop_proxy() -> None:
@@ -797,10 +894,14 @@ def stop_proxy() -> None:
 
 
 def restore_proxy() -> None:
+    data = read_input()
     if not SINGBOX_CONFIG.exists():
         fail("proxy_config_missing", "没有可恢复的代理配置")
     backup = backup_state()
     write_rollback(backup)
+    selection_value = data.get("selection")
+    selection = validate_selection(selection_value) if selection_value else None
+    staged = stage_config(selection)
     arm_rollback(120)
     enabled = run(["systemctl", "enable", "sing-box.service"], check=False)
     if enabled.returncode != 0:
@@ -814,6 +915,7 @@ def restore_proxy() -> None:
             "persistent": True,
             "rollback_armed": True,
             "activation_scheduled": True,
+            "config_sha256": staged["config_sha256"],
         }
     )
 
@@ -831,6 +933,9 @@ def uninstall() -> None:
         LOCAL_SINGBOX_SERVICE.unlink(missing_ok=True)
         run(["systemctl", "daemon-reload"], check=False)
     shutil.rmtree(LIBRARY, ignore_errors=True)
+    PENDING_CONFIG.unlink(missing_ok=True)
+    if original is None or not (original / "active-config.json").exists():
+        ACTIVE_CONFIG.unlink(missing_ok=True)
     if original is not None and not (original / "singbox-preexisting").exists():
         run(["apt-get", "remove", "-y", "sing-box"], check=False, timeout=300)
     mode = "proxy" if original is not None and (original / "service-active").exists() else "local"
@@ -852,6 +957,13 @@ def uninstall() -> None:
 def status() -> None:
     service = run(["systemctl", "is-active", "sing-box.service"], check=False)
     service_active = service.stdout.strip() == "active"
+    current_config_sha256 = config_sha256()
+    active_config = read_marker(ACTIVE_CONFIG)
+    config_consistent = bool(
+        service_active
+        and current_config_sha256
+        and active_config.get("config_sha256") == current_config_sha256
+    )
     rollback_armed = (
         run(["systemctl", "is-active", "--quiet", "vpspm-rollback.timer"], check=False).returncode
         == 0
@@ -921,6 +1033,9 @@ def status() -> None:
                 "agent_version": AGENT_VERSION if AGENT_SOURCE.exists() else None,
                 "singbox_active": service.stdout.strip(),
                 "singbox_service": service_snapshot(),
+                "config_sha256": current_config_sha256,
+                "active_config": active_config,
+                "config_consistent": config_consistent,
                 "rollback_armed": rollback_armed,
                 "activation_status": activation_status,
                 "singbox_version": version_lines[0] if version_lines else "",
@@ -1029,6 +1144,34 @@ def speedtest() -> None:
         average_access = (
             int(sum(x["access_latency_ms"] for x in samples) / len(samples)) if samples else None
         )
+        exit_info: dict[str, Any] = {}
+        if proxy_ok:
+            exit_probe = run(
+                [
+                    "curl",
+                    "--noproxy",
+                    "",
+                    "-x",
+                    f"http://127.0.0.1:{port}",
+                    "-4fsS",
+                    "--max-time",
+                    "15",
+                    "https://ifconfig.co/json",
+                ],
+                check=False,
+                timeout=20,
+            )
+            if exit_probe.returncode == 0:
+                try:
+                    exit_data = json.loads(exit_probe.stdout[:2000])
+                    if isinstance(exit_data, dict):
+                        exit_info = {
+                            "exit_ip": exit_data.get("ip"),
+                            "exit_country": exit_data.get("country"),
+                            "exit_country_iso": exit_data.get("country_iso"),
+                        }
+                except ValueError:
+                    pass
         ok(
             {
                 "result": {
@@ -1043,6 +1186,7 @@ def speedtest() -> None:
                     "attempts": attempts,
                     "successful_attempts": len(samples),
                     "samples": samples,
+                    **exit_info,
                     "test_url": "https://www.gstatic.com/generate_204",
                     "error": "" if proxy_ok else (curl_error or error or "proxy test failed"),
                 }

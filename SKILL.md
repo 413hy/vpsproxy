@@ -25,6 +25,8 @@ Do not merge these stores:
 3. Target VPS libraries: copies explicitly imported to that VPS; target tests run through that VPS.
 4. Target proxy state: one active outbound at most, or persistent local-exit mode.
 
+The controller periodically compares its expected target state with the Agent's active config SHA-256, resource fingerprint, sing-box service state, and connectivity. A persistent mismatch creates a `consistency_check` failure and automatically queues the read-only diagnosis Skill. Do not silently overwrite controller intent with observed remote state, and do not automatically replay a network-changing operation without explicit confirmation.
+
 ## Codex Admission Workflow
 
 The Telegram add-VPS wizard creates `VpsCandidate` and `CodexTask` records after SSH host-key confirmation. `vps-proxy-codex-worker.service` invokes Codex non-interactively with numeric IDs only. Codex must use `$vps-proxy-target-bootstrap`, which runs exactly:
@@ -81,7 +83,7 @@ mypy src
 pytest -q
 ```
 
-For proxy generator changes, also run generated configs through `sing-box check`. For migrations, test both a fresh database and an upgrade from revision `0001_initial`. For rollback changes, verify that a previously stopped service remains stopped after rollback and an active previous service is restored active.
+For proxy generator changes, also run generated configs through `sing-box check`. For migrations, test both a fresh database and an upgrade from revision `0001_initial`. For rollback changes, verify that a previously stopped service remains stopped after rollback and an active previous service is restored active. For apply changes, verify that an already-running sing-box service is restarted and success requires the active config hash and resource selection to match the current request.
 
 ## Recovery
 

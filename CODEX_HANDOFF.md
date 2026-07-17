@@ -13,7 +13,8 @@ Telegram Bot
   ├─ 控制端资源操作 -> 固定 TaskRunner -> 控制端 sing-box 测速
   ├─ 目标 VPS 操作  -> 固定 TaskRunner -> AsyncSSH -> 远端 Agent 固定 action
   ├─ 新 VPS 准入    -> CodexTask -> Codex Worker -> bootstrap Skill -> 固定 CLI
-  └─ 系统任务失败   -> CodexTask -> Codex Worker -> read-only diagnosis Skill
+  ├─ 系统任务失败   -> CodexTask -> Codex Worker -> read-only diagnosis Skill
+  └─ 状态一致性巡检 -> consistency_check -> Codex Worker -> read-only diagnosis Skill
 ```
 
 Codex 介入两类流程。新 VPS 初始化只收到候选 ID 和任务 ID，SSH 凭据由固定 CLI 从加密数据库读取。普通任务系统级失败时会自动创建只读诊断任务，只向 Codex 提供 Worker 生成的脱敏上下文和项目源码。
@@ -80,6 +81,8 @@ VPSPM_SECRET_KEY
 
 Codex 相关变量默认指向 `/usr/local/bin/codex`、`/root/.codex` 和 `/opt/vps-proxy-manager`。`doctor` 会校验 Fernet 密钥、Codex CLI 和登录状态。
 
+当前生产模型已实际调用验证为 `VPSPM_CODEX_MODEL=gpt-5.6-sol`、`VPSPM_CODEX_REASONING_EFFORT=high`。当前 ChatGPT 账号直接调用 `gpt-5.6` 会返回“不支持”错误，不要未经烟雾测试改回该 slug。
+
 ## 新 VPS 准入
 
 1. Bot 向导验证名称、主机、端口、用户和认证内容。
@@ -95,6 +98,8 @@ Codex 相关变量默认指向 `/usr/local/bin/codex`、`/root/.codex` 和 `/opt
 Worker 或 Codex 重启后，running 任务会失败，不自动重放高风险动作。
 
 失败任务无需用户主动请求排查。`TaskRunner` 在失败事务中创建一对一 `CodexTask(operation=diagnose)`；Worker 使用只读沙箱分析并主动发送 Telegram 结论。诊断本身不重试原任务。
+
+TaskRunner 还会周期核对数据库期望出口、远端活动配置 SHA-256、资源指纹、sing-box 状态和公网探测。巡检避开正在进行网络修改的 VPS；连续异常达到阈值后创建 `consistency_check` 失败任务并自动排队 Codex 诊断。出于断网风险控制，诊断不能未经确认自动重放切换、回滚或卸载。
 
 ## 目标 VPS 固定 action
 
@@ -116,11 +121,15 @@ uninstall status speedtest
 2. 绕过私网、本地网、控制端 SSH 来源 IP 和代理服务器 IP。
 3. 远端备份配置、systemd 单元、服务 active/enabled 状态、路由/rule/nft/resolver 快照。
 4. 写入 `/etc/vps-proxy-manager/rollback-last.sh` 并启动 `vpspm-rollback.timer`。
-5. `sing-box check` 成功后才替换配置并启动。
-6. 控制端建立新的 SSH 会话，检查服务 active 和真实 HTTPS 204 访问。
-7. 仅在验证成功后调用 `confirm_proxy` 解除定时器并更新数据库当前节点。
+5. `sing-box check` 成功后写入配置与 `pending-config.json`，内容包含配置 SHA-256 和不可逆资源指纹。
+6. 延迟 activation 必须执行 `systemctl restart sing-box.service`；`start` 无法让已运行进程加载新配置，禁止改回。
+7. 进程稳定后 Agent 才把待加载标识提升为 `active-config.json`。
+8. 控制端建立新的 SSH 会话，核对服务、活动哈希、资源指纹和真实公网访问。
+9. 仅在全部验证成功后调用 `confirm_proxy` 解除定时器并更新数据库当前节点。
 
 回滚必须恢复备份时的服务启用和运行状态。旧配置存在并不代表旧服务原本处于运行状态；不要重新引入“有配置就启动”的错误。
+
+每个 VPS 相关任务的 Telegram 详情必须提供 `查看此 VPS`。应用当前已核对节点时应直接提示无需重复切换；不得再次创建网络修改任务。测速详情应显示 DNS、TCP、代理握手、真实访问延迟和测试代理返回的出口。
 
 ## 出口操作语义
 

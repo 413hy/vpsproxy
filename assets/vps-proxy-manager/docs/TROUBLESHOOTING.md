@@ -94,6 +94,12 @@ sudo nft list ruleset
 
 0.3.1 起不再让启动 TUN 的动作占用原 SSH 命令通道。Agent 先返回，再由公开的 `vpspm-activate.timer/service` 延迟启动；控制端使用全新 SSH 连接验证。管理来源 IP、代理服务器 IP 和私网地址同时加入 sing-box 路由规则与 TUN `route_exclude_address`。失败时 activation 状态、脱敏 FATAL/ERROR 和 systemd 结果会进入自动诊断上下文。
 
+## 配置显示已切换但出口仍是旧节点
+
+0.3.1 的延迟激活使用 `systemctl start`。当 sing-box 已运行时，systemd 不会重新读取刚写入的配置，可能出现数据库和磁盘已是新节点、运行进程仍使用旧出站。0.3.2 改为受回滚保护的 `restart`，并要求活动配置 SHA-256 与资源指纹完全匹配后才报告成功。
+
+升级后重新应用目标节点。VPS 页面中的“配置一致性”应为“已核对”，任务结果应显示实际出口。后台巡检连续发现不一致时会自动创建 `consistency_check` 失败任务并唤醒 Codex 诊断。
+
 ## 本地出口仍显示代理 IP
 
 1. Telegram 执行 `切回本地出口`。

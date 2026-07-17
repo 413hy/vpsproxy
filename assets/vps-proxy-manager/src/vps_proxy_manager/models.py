@@ -63,6 +63,7 @@ class TaskKind(StrEnum):
     delete_source_subscription = "delete_source_subscription"
     uninstall = "uninstall"
     delete_host = "delete_host"
+    consistency_check = "consistency_check"
 
 
 class NodeStatus(StrEnum):

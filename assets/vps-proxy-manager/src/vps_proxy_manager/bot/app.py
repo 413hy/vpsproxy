@@ -73,6 +73,7 @@ from vps_proxy_manager.models import (
     CodexTaskStatus,
     HostLifecycle,
     ProxyMode,
+    ResourceKind,
     Task,
     TaskKind,
     TaskStatus,
@@ -307,6 +308,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await show_home(update, context)
         elif data in {"help", "settings"}:
             await show_settings(update, context)
+        elif data == "ctl:status":
+            await show_controller_status(update, context)
         elif data == "h:list":
             await show_hosts(update, context)
         elif data.startswith("h:v:"):
@@ -511,6 +514,7 @@ async def show_host(update: Update, context: ContextTypes.DEFAULT_TYPE, host_id:
         f"sing-box：{last_status.get('singbox_version') or '未知'}\n"
         f"出口模式：{mode_label}\n"
         f"当前节点：{state.current_display_name or '未选择'}\n"
+        f"配置一致性：{_consistency_label(state.mode, last_status)}\n"
         f"出口 IP：{exit_ip}\n"
         f"出口地区：{exit_region}\n"
         f"DNS 路由：{'TUN 劫持并经代理' if last_status.get('dns_mode') == 'tun_hijack_to_proxy' else '系统本地'}\n"
@@ -1148,6 +1152,52 @@ async def enqueue_task(
 ) -> None:
     async with deps(context).session_factory() as session:
         repo = Repository(session, deps(context).secret_box)
+        if kind == TaskKind.apply_proxy and host_id:
+            host = await repo.get_host(host_id)
+            state = await repo.get_proxy_state(host_id)
+            expected_selection: dict[str, Any] | None = None
+            resource_callback = f"h:v:{host_id}"
+            selected_name = state.current_display_name or "当前节点"
+            if payload.get("vps_node_id"):
+                item = await repo.get_vps_node(int(payload["vps_node_id"]))
+                expected_selection = {
+                    "kind": ResourceKind.node.value,
+                    "resource_id": item.id,
+                    "fingerprint": item.fingerprint,
+                }
+                resource_callback = f"vn:v:{item.id}"
+                selected_name = item.name
+            elif payload.get("vps_subscription_entry_id"):
+                entry = await repo.get_vps_subscription_entry(
+                    int(payload["vps_subscription_entry_id"])
+                )
+                sub = await repo.get_vps_subscription(entry.vps_subscription_id)
+                expected_selection = {
+                    "kind": ResourceKind.subscription.value,
+                    "resource_id": sub.id,
+                    "fingerprint": entry.fingerprint,
+                }
+                resource_callback = f"vse:v:{entry.id}"
+                selected_name = entry.name
+            active_config = (host.last_status or {}).get("active_config", {})
+            if (
+                state.mode == ProxyMode.proxy
+                and (host.last_status or {}).get("singbox_active") == "active"
+                and (host.last_status or {}).get("config_consistent") is True
+                and isinstance(active_config, dict)
+                and active_config.get("selection") == expected_selection
+            ):
+                await _edit(
+                    update,
+                    f"{selected_name} 已经是当前出口，远端运行配置已核对一致，无需重复切换。",
+                    InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("查看此 VPS", callback_data=f"h:v:{host_id}")],
+                            [InlineKeyboardButton("返回节点详情", callback_data=resource_callback)],
+                        ]
+                    ),
+                )
+                return
         recent = await repo.recent_tasks(500)
         duplicate = next(
             (
@@ -1165,7 +1215,12 @@ async def enqueue_task(
             await _edit(
                 update,
                 f"相同任务 #{duplicate.id} 已在执行。",
-                task_detail(duplicate.id, True),
+                task_detail(
+                    duplicate.id,
+                    True,
+                    return_callback=_task_return_callback(duplicate),
+                    return_label=_task_return_label(duplicate),
+                ),
             )
             return
         if host_id and kind in NETWORK_MUTATING:
@@ -1181,7 +1236,12 @@ async def enqueue_task(
                 await _edit(
                     update,
                     f"该 VPS 已有网络任务 #{active[0].id} 正在执行。",
-                    task_detail(active[0].id, True),
+                    task_detail(
+                        active[0].id,
+                        True,
+                        return_callback=_task_return_callback(active[0]),
+                        return_label=_task_return_label(active[0]),
+                    ),
                 )
                 return
         task = await repo.create_task(
@@ -1192,7 +1252,16 @@ async def enqueue_task(
         )
         await session.commit()
     await deps(context).runner.enqueue(task.id)
-    await _edit(update, _task_text(task), task_detail(task.id, True))
+    await _edit(
+        update,
+        _task_text(task),
+        task_detail(
+            task.id,
+            True,
+            return_callback=_task_return_callback(task),
+            return_label=_task_return_label(task),
+        ),
+    )
     _start_task_monitor(update, context, task.id)
 
 
@@ -1222,6 +1291,7 @@ async def show_tasks(
         for item in codex_tasks
     )
     rows.append([InlineKeyboardButton("刷新", callback_data="t:list")])
+    rows.append([InlineKeyboardButton("返回概览", callback_data="home")])
     await _send_or_edit(update, "任务中心", InlineKeyboardMarkup(rows), new_message)
 
 
@@ -1240,6 +1310,8 @@ async def show_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
             result_callback=_task_result_callback(item),
             codex_task_id=_task_codex_id(item),
             resolved_task_id=_resolved_task_id(item),
+            return_callback=_task_return_callback(item),
+            return_label=_task_return_label(item),
         ),
     )
 
@@ -1247,6 +1319,7 @@ async def show_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id:
 async def show_codex_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> None:
     async with deps(context).session_factory() as session:
         item = await Repository(session, deps(context).secret_box).get_codex_task(task_id)
+        source = await session.get(Task, item.source_task_id) if item.source_task_id else None
     text = (
         f"Codex 任务 #{item.id}\n操作：{item.operation}\n状态：{item.status.value}\n"
         f"进度：{item.progress}%\n结果：{item.message}"
@@ -1267,16 +1340,25 @@ async def show_codex_task(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
         rows.append(
             [InlineKeyboardButton("查看原任务", callback_data=f"t:v:{item.source_task_id}")]
         )
+    if source and source.host_id:
+        rows.append([InlineKeyboardButton("查看此 VPS", callback_data=f"h:v:{source.host_id}")])
     rows.append([InlineKeyboardButton("返回", callback_data="t:list")])
     await _edit(update, text[:4000], InlineKeyboardMarkup(rows))
 
 
 async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int) -> None:
     canceled = await deps(context).runner.request_cancel(task_id)
+    async with deps(context).session_factory() as session:
+        task = await session.get(Task, task_id)
     await _edit(
         update,
         "已请求取消，当前远端子操作结束后生效。" if canceled else "任务已经结束，无法取消。",
-        task_detail(task_id, canceled),
+        task_detail(
+            task_id,
+            canceled,
+            return_callback=_task_return_callback(task) if task else None,
+            return_label=_task_return_label(task) if task else "返回对应页面",
+        ),
     )
 
 
@@ -1289,14 +1371,24 @@ async def show_controller_status(
         subs = await repo.count_subscriptions()
         hosts = await repo.list_hosts()
     settings = deps(context).settings
+    monitor_text = (
+        f"启用（每 {settings.monitor_interval_seconds} 秒）" if settings.monitor_enabled else "停用"
+    )
     text = (
         "控制端状态\n\n"
         f"数据库：正常\n单节点：{nodes}\n订阅：{subs}\nVPS：{len(hosts)}\n"
         f"Codex Worker：{'启用' if settings.codex_enabled else '停用'}\n"
+        f"Codex 模型：{settings.codex_model} · {settings.codex_reasoning_effort}\n"
+        f"一致性巡检：{monitor_text}\n"
         f"本地测速并发：{settings.speedtest_concurrency}\n"
         f"远端自动回滚：{settings.remote_rollback_seconds} 秒"
     )
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton("刷新", callback_data="home")]])
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("刷新", callback_data="ctl:status")],
+            [InlineKeyboardButton("返回概览", callback_data="home")],
+        ]
+    )
     await _send_or_edit(update, text, markup, new_message)
 
 
@@ -1764,6 +1856,8 @@ async def _monitor_task(
                         result_callback=_task_result_callback(task),
                         codex_task_id=_task_codex_id(task),
                         resolved_task_id=_resolved_task_id(task),
+                        return_callback=_task_return_callback(task),
+                        return_label=_task_return_label(task),
                     ),
                 )
             except BadRequest as exc:
@@ -1895,6 +1989,17 @@ def _outbound_info(status: dict[str, Any]) -> tuple[str, str]:
     return ip, region
 
 
+def _consistency_label(mode: ProxyMode, status: dict[str, Any]) -> str:
+    active = status.get("singbox_active") == "active"
+    if mode == ProxyMode.proxy:
+        if active and status.get("config_consistent") is True:
+            return "已核对"
+        if status.get("config_consistent") is False or not active:
+            return "异常"
+        return "等待新版 Agent 核对"
+    return "已核对" if not active else "异常"
+
+
 def _task_text(task: Task) -> str:
     resolved_task_id = _resolved_task_id(task)
     return (
@@ -1919,6 +2024,24 @@ def _task_result_callback(task: Task) -> str | None:
     return None
 
 
+def _task_return_callback(task: Task) -> str:
+    if task.host_id:
+        return f"h:v:{task.host_id}"
+    if task.kind == TaskKind.local_node_test:
+        return "n:list:0"
+    if task.kind == TaskKind.local_subscription_test and task.payload.get("subscription_id"):
+        return f"s:v:{int(task.payload['subscription_id'])}"
+    if task.kind == TaskKind.delete_source_node:
+        return "n:list:0"
+    if task.kind == TaskKind.delete_source_subscription:
+        return "s:list:0"
+    return "home"
+
+
+def _task_return_label(task: Task) -> str:
+    return "查看此 VPS" if task.host_id else "返回对应管理"
+
+
 def _task_codex_id(task: Task) -> int | None:
     value = (task.result or {}).get("codex_diagnostic_task_id")
     return int(value) if isinstance(value, int | str) and str(value).isdigit() else None
@@ -1935,13 +2058,16 @@ def _test_result_text(item: Any) -> str:
     dns = "成功" if result.get("dns_ok") else "失败"
     tcp = "成功" if result.get("tcp_ok") else "失败"
     proxy = "成功" if result.get("proxy_ok") else "失败"
+    exit_text = str(result.get("exit_ip") or "未检测")
+    if result.get("exit_country_iso"):
+        exit_text += f" ({result['exit_country_iso']})"
     return (
         f"状态：{item.status.value}\n"
         f"DNS：{dns} · {_ms(result.get('dns_latency_ms'))}\n"
         f"TCP：{tcp} · {_ms(result.get('tcp_latency_ms'))}\n"
         f"代理握手：{proxy} · {_ms(result.get('proxy_handshake_ms'))}\n"
-        f"真实访问：{_ms(result.get('access_latency_ms'))}"
-        + (f"\n失败原因：{error}" if error else "")
+        f"真实访问：{_ms(result.get('access_latency_ms'))}\n"
+        f"节点出口：{exit_text}" + (f"\n失败原因：{error}" if error else "")
     )
 
 
