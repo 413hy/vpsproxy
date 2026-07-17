@@ -1,91 +1,57 @@
-# vpsproxy-skill
+# VPS Proxy Manager Codex Skill
 
-这是一个 Codex Skill + 可部署 Telegram Bot 项目，用于在一台“控制端 VPS”上通过 Telegram Bot 管理本人拥有或已明确授权的目标 VPS，并在目标 VPS 上安装、配置和管理系统级全局代理。
+这是一个可直接部署到控制端 VPS 的 Codex Skill 和 Telegram Bot 项目。它只用于管理本人拥有或已明确授权的 Debian/Ubuntu VPS，并通过 sing-box TUN 管理目标 VPS 的系统级出站代理。
 
-核心能力：
+## 当前架构
 
-- 通过 Telegram 按钮菜单添加和管理目标 VPS
-- 支持 SSH 密码或 SSH 私钥连接目标 VPS
-- SSH 主机指纹校验，避免中间人攻击
-- 导入 VLESS Reality 单节点和常见订阅格式
-- 从目标 VPS 发起节点可用性/延迟测试
-- 使用 `sing-box` TUN 配置系统级全局出站代理
-- 自动备份目标 VPS 网络/代理配置
-- 应用代理前设置自动回滚保护，降低目标 VPS 失联风险
-- 支持停止、恢复、回滚和卸载代理
-- Telegram 管理员白名单，默认拒绝未授权用户
-- 凭据加密存储，日志脱敏
+系统刻意分成四个边界：
 
-只允许用于你本人拥有或已获得明确授权管理的 VPS。
+| 边界 | 职责 |
+| --- | --- |
+| 控制端单节点库 | 只保存手工导入的单节点，在控制端本地测速 |
+| 控制端订阅库 | 保存完整订阅及其独立缓存条目，在控制端本地更新和测速；条目不会进入单节点库 |
+| 每台目标 VPS | 保存导入到该 VPS 的单节点/订阅副本，并从该 VPS 发起测速；任一时刻只允许一个代理出站 |
+| Codex Worker | 仅对待准入 VPS 执行受控初始化和验收；不把 Telegram 文本转换成任意 Shell |
 
-## Codex 介入边界
+新 VPS 的流程是：Telegram 收集连接参数并确认 SSH 主机指纹，创建候选记录，Codex Worker 调用内置 `$vps-proxy-target-bootstrap` Skill，Skill 再调用固定 CLI。只有远端 Agent、TUN、sing-box、本地出口和 SSH 验证全部通过后，VPS 才进入正式管理库。
 
-Codex 介入的是控制端项目的部署、配置、测试、升级、诊断和修复。运行时 Telegram Bot 不会把用户消息交给 Codex 临时生成 shell，也不会让 Telegram 输入拼接成任意命令。
+## 功能
 
-设计边界是：
+- Telegram Reply Keyboard 主菜单和 Inline Keyboard 列表、分页、确认、返回、取消
+- SSH 密码或私钥认证及 SSH 主机指纹固定
+- VLESS Reality/XTLS Vision、VMess、Trojan、Shadowsocks、Hysteria2 节点解析
+- 普通链接列表、Base64、Clash YAML 和 sing-box JSON 订阅解析
+- 控制端测速与目标 VPS 本机测速相互独立
+- DNS、TCP、代理握手和真实 HTTPS 访问延迟分项记录
+- sing-box TUN、DNS 劫持、私网/管理连接/代理服务器绕过
+- 自动回滚定时器、配置版本备份、持久本地出口、恢复代理和卸载
+- 管理员白名单、SSRF 防护、加密凭据、结构化脱敏日志和审计记录
+- SQLite/SQLAlchemy/Alembic、异步任务、每 VPS 网络修改互斥锁
 
-```text
-Codex：安装/升级/诊断/修复控制端项目，必要时运行受控 CLI
-Telegram Bot：收集参数、展示菜单、创建受控任务
-后端任务：按固定函数 SSH 到目标 VPS
-目标 VPS：只执行固定 payload action，例如 detect/status/speedtest/apply_proxy/stop_proxy/rollback
-```
-
-这样保留了 Codex 的运维介入能力，同时避免把生产运行架构变成“聊天消息驱动任意命令执行”。
-
-## 仓库结构
+## 目录
 
 ```text
 .
-├── SKILL.md
+├── SKILL.md                         # 控制端 Codex Skill
+├── CODEX_HANDOFF.md                 # 给另一个 Codex 的完整交接
 ├── agents/openai.yaml
-├── CODEX_HANDOFF.md
 └── assets/vps-proxy-manager/
-    ├── README.md
-    ├── .env.example
-    ├── pyproject.toml
-    ├── src/vps_proxy_manager/
-    ├── scripts/
-    ├── systemd/
-    ├── migrations/
+    ├── codex-skills/vps-proxy-target-bootstrap/  # Codex 准入子 Skill
+    ├── src/vps_proxy_manager/       # Bot、任务、SSH、解析、配置、Codex Worker
+    ├── migrations/                  # Alembic 迁移
+    ├── scripts/                     # 安装、升级、卸载、紧急恢复
+    ├── systemd/                     # Bot 与 Codex Worker 服务
     ├── tests/
     └── docs/
 ```
 
-说明：
-
-- `SKILL.md`：给 Codex 使用的 Skill 入口说明。
-- `assets/vps-proxy-manager/`：真正可安装运行的 Telegram Bot 后端项目。
-- `assets/vps-proxy-manager/scripts/install.sh`：控制端 VPS 一键安装脚本。
-- `assets/vps-proxy-manager/.env.example`：环境变量模板，不包含真实密钥。
-- `assets/vps-proxy-manager/docs/`：架构、安全、Telegram 操作和恢复文档。
-- `CODEX_HANDOFF.md`：给另一个 Codex/运维 agent 的交接说明。
-
 ## 最低要求
 
-控制端 VPS：
+控制端：Debian 12 或 Ubuntu 22.04/24.04、systemd、root、Python 3.11+、Codex CLI 已安装并登录、可访问 Telegram API 和目标 SSH。
 
-- Debian/Ubuntu
-- systemd
-- Python 3.11+
-- 能访问 Telegram API
-- 能 SSH 访问目标 VPS
+目标端：Debian/Ubuntu、systemd、root 或免交互 sudo、Python 3、`/dev/net/tun`、IPv4；IPv6 取决于目标网络。容器型 VPS 必须提供 TUN 和 `CAP_NET_ADMIN`。
 
-目标 VPS：
-
-- Debian/Ubuntu 优先支持
-- systemd
-- root 或具备 sudo 权限的 SSH 用户
-- `/dev/net/tun` 可用
-- IPv4 可用
-
-代理核心：
-
-- `sing-box`，由程序在目标 VPS 首次测速或应用代理时安装。
-
-## 快速部署
-
-在控制端 VPS 上执行：
+## 部署
 
 ```bash
 git clone https://github.com/413hy/vpsproxy-skill.git
@@ -93,192 +59,95 @@ cd vpsproxy-skill/assets/vps-proxy-manager
 sudo ./scripts/install.sh
 ```
 
-安装后编辑配置：
+安装脚本会创建：
+
+```text
+/opt/vps-proxy-manager
+/etc/vps-proxy-manager/vps-proxy-manager.env
+/root/.codex/skills/vps-proxy-target-bootstrap
+```
+
+生成加密密钥并编辑配置：
 
 ```bash
+sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager keygen
 sudo nano /etc/vps-proxy-manager/vps-proxy-manager.env
 ```
 
 至少填写：
 
 ```env
-VPSPM_TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token
-VPSPM_ADMIN_USER_IDS=你的 Telegram 数字用户 ID
-VPSPM_SECRET_KEY=用下面命令生成的 Fernet 密钥
+VPSPM_TELEGRAM_BOT_TOKEN=BotFather提供的Token
+VPSPM_ADMIN_USER_IDS=你的Telegram数字用户ID
+VPSPM_SECRET_KEY=上一步生成的Fernet密钥
 ```
 
-生成 `VPSPM_SECRET_KEY`：
+验证并启动两个服务：
 
 ```bash
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager keygen
-```
-
-初始化并启动：
-
-```bash
+sudo codex login status
 sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager init-db
-sudo systemctl enable --now vps-proxy-manager.service
+sudo systemctl enable --now vps-proxy-manager.service vps-proxy-codex-worker.service
+sudo systemctl --no-pager --full status vps-proxy-manager.service vps-proxy-codex-worker.service
 ```
 
-查看状态：
+## Telegram 使用
 
-```bash
-sudo systemctl status vps-proxy-manager.service --no-pager
-sudo journalctl -u vps-proxy-manager.service -f
-```
+1. 私聊 Bot，发送 `/start`。
+2. `VPS 管理` -> `添加 VPS`，完成名称、地址、端口、用户、认证方式和主机指纹确认。
+3. 等待 Codex 初始化任务成功；成功前不会出现在正式 VPS 列表。
+4. 在 `单节点库` 导入单链接，或在 `订阅库` 导入完整 HTTPS 订阅。
+5. 可先在控制端本地测速；选择资源后点击 `导入指定 VPS`。
+6. 进入目标 VPS 的 `单节点` 或 `订阅`，从该 VPS 测速。
+7. 选择一个可用节点并二次确认，设为该 VPS 唯一当前出站。
+8. `切回本地出口` 只停用代理，资源和上次配置保留；`启用上次代理` 可恢复。
 
-## Telegram Bot 使用流程
+删除控制端资源时，Bot 会列出正在使用它的 VPS。只有再次确认“强制删除所有副本”后，才会先让相关 VPS 切回本地出口并移除副本。
 
-1. 在 Telegram 打开你的 Bot，发送 `/start`。
-2. 点击 `添加 VPS`。
-3. 按向导输入：
-   - VPS 名称
-   - IP 或域名
-   - SSH 端口
-   - SSH 用户名
-   - 密码或 SSH 私钥
-4. Bot 会测试 SSH，并保存目标 VPS 的 SSH 主机指纹。
-5. 点击 `导入单节点` 或 `导入订阅`。
-6. 在 `代理节点` 页面选择节点。
-7. 先选择 `测试此节点`，从目标 VPS 发起测速。
-8. 确认节点可用后选择 `选择并应用到 VPS`。
-9. 高风险操作会二次确认。
-10. 在 `当前状态` 中查看目标 VPS 当前代理状态。
+## 出口与恢复语义
 
-## 出口模式
+- `切回本地出口`：`disable --now sing-box`，重启后仍使用 VPS 原出口，资源不删除。
+- `启用上次代理`：先设置自动回滚，再启动上次配置；新 SSH 与公网访问验证成功后解除保护。
+- `回滚配置`：恢复上一次配置文件和当时的 systemd 启用/运行状态。
+- `卸载代理`：恢复初始化前的 sing-box 状态，删除本系统在目标 VPS 上的资源库，保留 Agent 和恢复备份以便重新初始化。
+- `删除 VPS`：可仅删除控制端记录，或先远端卸载再删除。
 
-系统里有两个明确模式：
-
-- 代理出口：目标 VPS 的主要出站流量通过当前选中节点。
-- 本地出口：目标 VPS 不走代理，恢复为 VPS 原本的本地公网出口。
-
-Telegram 里的 `切回本地出口` 会在目标 VPS 上执行：
-
-```bash
-systemctl disable --now sing-box.service
-```
-
-因此它是持久化的：目标 VPS 重启后也不会自动重新走代理。
-
-Telegram 里的 `启用代理` 会重新执行：
-
-```bash
-systemctl enable --now sing-box.service
-```
-
-也就是恢复之前已经写入的 sing-box 配置。
-
-## 支持的代理输入
-
-单节点：
-
-- 已重点支持 VLESS + TCP + Reality + XTLS Vision。
-- 示例格式：`vless://...?...security=reality...#name`
-
-订阅：
-
-- 普通节点链接列表
-- Base64 编码订阅
-- Clash YAML
-- sing-box JSON
-- 常见 VMess/Trojan/VLESS 节点尽量解析
-
-订阅下载有 SSRF 防护：
-
-- 仅允许 HTTPS
-- 限制重定向次数
-- 限制响应大小
-- 限制超时
-- 默认阻止本地地址、私有地址、云元数据地址
-
-## 重要安全说明
-
-- 不要把真实 `.env`、Bot Token、SSH 密码、私钥、订阅链接提交到 Git。
-- Telegram 不是高安全级别密码保险库，Bot 会尽量删除敏感消息，但它们已经经过 Telegram 平台传输。
-- 首次在一类新 VPS 上应用全局 TUN 代理前，必须确保有云厂商 VNC/救援控制台。
-- 如果 Bot Token 曾出现在日志中，请去 BotFather 轮换 Token。
-- 本项目不会根据 Telegram 输入拼接任意 shell 命令；远程操作通过固定 Python payload action 执行。
-
-## 常用运维命令
-
-```bash
-# 本地检查
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
-
-# 初始化数据库
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager init-db
-
-# 重启 Bot
-sudo systemctl restart vps-proxy-manager.service
-
-# 查看日志
-sudo journalctl -u vps-proxy-manager.service -n 100 --no-pager
-
-# 升级
-cd vpsproxy-skill/assets/vps-proxy-manager
-sudo ./scripts/upgrade.sh
-
-# 卸载控制端服务，保留数据
-sudo ./scripts/uninstall.sh
-```
-
-## 目标 VPS 失联恢复
-
-代理应用前会在目标 VPS 上创建回滚脚本和 systemd 回滚定时器。若仍然失联：
-
-1. 打开云厂商 VNC/救援控制台。
-2. 在目标 VPS 上执行：
+目标失联时通过云厂商控制台执行：
 
 ```bash
 sudo /etc/vps-proxy-manager/rollback-last.sh
 ```
 
-如果该脚本不存在，可使用仓库中的：
+脚本不存在时使用仓库中的 `assets/vps-proxy-manager/scripts/emergency_restore.sh`。兜底脚本只停止 sing-box，不删除未知的原有配置。
+
+## 运维
 
 ```bash
-assets/vps-proxy-manager/scripts/emergency_restore.sh
+# 日志
+sudo journalctl -u vps-proxy-manager.service -u vps-proxy-codex-worker.service -n 200 --no-pager
+
+# 升级
+cd vpsproxy-skill/assets/vps-proxy-manager
+sudo ./scripts/upgrade.sh
+
+# 控制端卸载服务，保留数据库与环境文件
+sudo ./scripts/uninstall.sh
 ```
 
-更多说明见：
+备份时必须同时保存 `/opt/vps-proxy-manager/data/` 和 `/etc/vps-proxy-manager/vps-proxy-manager.env`。丢失 `VPSPM_SECRET_KEY` 后，数据库中的 SSH 凭据和代理资源无法解密。
 
-- `assets/vps-proxy-manager/docs/RECOVERY.md`
-- `assets/vps-proxy-manager/docs/TROUBLESHOOTING.md`
-
-## 开发和测试
+## 验证
 
 ```bash
 cd assets/vps-proxy-manager
 python3.11 -m venv .venv
 . .venv/bin/activate
-pip install -e ".[dev]"
-ruff check .
+pip install -e '.[dev]'
+ruff check src tests migrations
 mypy src
-pytest
+pytest -q
 ```
 
-当前测试覆盖：
+详细资料见 [部署文档](assets/vps-proxy-manager/docs/DEPLOYMENT.md)、[架构](assets/vps-proxy-manager/docs/ARCHITECTURE.md)、[安全设计](assets/vps-proxy-manager/docs/SECURITY.md)、[Telegram 操作](assets/vps-proxy-manager/docs/TELEGRAM.md)、[恢复](assets/vps-proxy-manager/docs/RECOVERY.md)和[故障排查](assets/vps-proxy-manager/docs/TROUBLESHOOTING.md)。
 
-- VLESS Reality 节点解析
-- 普通/Base64/Clash/sing-box 订阅解析
-- SSRF 防护
-- sing-box TUN 配置生成
-- 输入校验和脱敏
-- 远端回滚脚本生成
-
-## 当前限制
-
-- 目标 VPS 自动化重点支持 Debian/Ubuntu。
-- IPv6 配置会生成，但依赖目标 VPS 网络和内核支持。
-- 默认实现的是连通性和延迟测试，下载测速属于可扩展项。
-- TUN/透明代理依赖 `/dev/net/tun` 和 `CAP_NET_ADMIN`，部分容器型 VPS 可能不可用。
-
-## 给 Codex 的入口
-
-如果把这个仓库交给另一个 Codex，先让它阅读：
-
-1. `CODEX_HANDOFF.md`
-2. `SKILL.md`
-3. `assets/vps-proxy-manager/README.md`
-4. `assets/vps-proxy-manager/docs/SECURITY.md`
-5. `assets/vps-proxy-manager/docs/RECOVERY.md`
+本项目不得用于未授权主机。首次在新 VPS 类型上启用全局 TUN 前，必须确认云厂商控制台可用。

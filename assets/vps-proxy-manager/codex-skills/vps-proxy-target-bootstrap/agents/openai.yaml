@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPS Proxy Target Bootstrap"
+  short_description: "Initialize and validate an authorized VPS through the controlled provisioner"
+  default_prompt: "Use $vps-proxy-target-bootstrap to process the supplied numeric VPS candidate task."

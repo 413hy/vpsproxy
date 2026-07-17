@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import yaml
 
 SUPPORTED_SCHEMES = {"vless", "vmess", "trojan", "ss", "hysteria2"}
+LINK_SCHEMES = SUPPORTED_SCHEMES | {"hy2"}
 
 
 @dataclass(frozen=True)
@@ -48,11 +49,23 @@ def _b64decode_padded(value: str) -> bytes:
     return base64.urlsafe_b64decode((value + padding).encode("ascii"))
 
 
+def _plugin_opts_string(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value or "")
+    parts: list[str] = []
+    for key, item in value.items():
+        if item is True:
+            parts.append(str(key))
+        elif item is not False and item is not None and item != "":
+            parts.append(f"{key}={item}")
+    return ";".join(parts)
+
+
 def parse_node_link(link: str) -> ProxyNodeSpec:
     link = link.strip()
     parsed = urlparse(link)
     scheme = parsed.scheme.lower()
-    if scheme not in SUPPORTED_SCHEMES:
+    if scheme not in LINK_SCHEMES:
         raise ParseError(f"unsupported proxy scheme: {scheme or 'empty'}")
     if scheme == "vless":
         return parse_vless(link)
@@ -60,6 +73,10 @@ def parse_node_link(link: str) -> ProxyNodeSpec:
         return parse_vmess(link)
     if scheme == "trojan":
         return parse_trojan(link)
+    if scheme == "ss":
+        return parse_shadowsocks(link)
+    if scheme in {"hysteria2", "hy2"}:
+        return parse_hysteria2(link)
     if not parsed.hostname or not parsed.port:
         raise ParseError("proxy link missing server or port")
     return ProxyNodeSpec(
@@ -74,7 +91,7 @@ def parse_node_link(link: str) -> ProxyNodeSpec:
 
 def parse_node_blob(blob: str) -> ProxyNodeSpec:
     blob = blob.strip()
-    if any(blob.startswith(f"{scheme}://") for scheme in SUPPORTED_SCHEMES):
+    if any(blob.startswith(f"{scheme}://") for scheme in LINK_SCHEMES):
         return parse_node_link(blob)
     try:
         data = json.loads(blob)
@@ -144,6 +161,77 @@ def parse_trojan(link: str) -> ProxyNodeSpec:
     )
 
 
+def parse_shadowsocks(link: str) -> ProxyNodeSpec:
+    parsed = urlparse(link)
+    name = unquote(parsed.fragment) or "shadowsocks"
+    query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+    method = ""
+    password = ""
+    server = parsed.hostname or ""
+    port = parsed.port or 0
+    if parsed.username and server and port:
+        userinfo = unquote(parsed.username)
+        try:
+            decoded = userinfo if ":" in userinfo else _b64decode_padded(userinfo).decode("utf-8")
+        except Exception as exc:
+            raise ParseError("invalid Shadowsocks user info") from exc
+        method, separator, password = decoded.partition(":")
+        if not separator:
+            raise ParseError("Shadowsocks link missing method or password")
+    else:
+        raw = link.removeprefix("ss://").split("#", 1)[0].split("?", 1)[0]
+        try:
+            decoded = _b64decode_padded(raw).decode("utf-8")
+            credentials, separator, endpoint = decoded.rpartition("@")
+            method, method_separator, password = credentials.partition(":")
+            endpoint_url = urlparse(f"ss://{endpoint}")
+            server = endpoint_url.hostname or ""
+            port = endpoint_url.port or 0
+        except Exception as exc:
+            raise ParseError("invalid legacy Shadowsocks link") from exc
+        if not separator or not method_separator:
+            raise ParseError("Shadowsocks link missing credentials or endpoint")
+    if not method or not password or not server or not port:
+        raise ParseError("Shadowsocks link missing method, password, server, or port")
+    plugin, _, plugin_opts = query.get("plugin", "").partition(";")
+    return ProxyNodeSpec(
+        name=name if name != "shadowsocks" else f"ss-{server}:{port}",
+        protocol="ss",
+        server=server,
+        port=port,
+        link=link,
+        params={
+            "method": method,
+            "password": password,
+            "plugin": plugin,
+            "plugin_opts": plugin_opts,
+        },
+    )
+
+
+def parse_hysteria2(link: str) -> ProxyNodeSpec:
+    parsed = urlparse(link)
+    if not parsed.username or not parsed.hostname or not parsed.port:
+        raise ParseError("Hysteria2 link missing password, server, or port")
+    query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+    return ProxyNodeSpec(
+        name=unquote(parsed.fragment) or f"hysteria2-{parsed.hostname}:{parsed.port}",
+        protocol="hysteria2",
+        server=parsed.hostname,
+        port=parsed.port,
+        link=link,
+        params={
+            "password": unquote(parsed.username),
+            "sni": query.get("sni") or query.get("peer") or parsed.hostname,
+            "insecure": query.get("insecure", "0") in {"1", "true", "yes"},
+            "obfs": query.get("obfs", ""),
+            "obfs-password": query.get("obfs-password", ""),
+            "up_mbps": query.get("upmbps") or query.get("up_mbps"),
+            "down_mbps": query.get("downmbps") or query.get("down_mbps"),
+        },
+    )
+
+
 def parse_vmess(link: str) -> ProxyNodeSpec:
     raw = link.removeprefix("vmess://")
     try:
@@ -184,7 +272,7 @@ def _parse_plain_links(text: str) -> list[ProxyNodeSpec]:
     nodes: list[ProxyNodeSpec] = []
     for line in text.splitlines():
         line = line.strip()
-        if any(line.startswith(f"{scheme}://") for scheme in SUPPORTED_SCHEMES):
+        if any(line.startswith(f"{scheme}://") for scheme in LINK_SCHEMES):
             nodes.append(parse_node_link(line))
     return nodes
 
@@ -233,18 +321,31 @@ def _spec_from_clash_proxy(item: dict[str, Any]) -> ProxyNodeSpec | None:
     params = dict(item)
     if typ == "vless":
         params.setdefault("uuid", item.get("uuid"))
-        params.setdefault("security", item.get("network") or item.get("tls") or "")
         params.setdefault("sni", item.get("servername") or item.get("sni") or "")
         reality_opts = item.get("reality-opts")
         if isinstance(reality_opts, dict):
-            params.setdefault("security", "reality")
-            params.setdefault("pbk", reality_opts.get("public-key") or reality_opts.get("public_key"))
-            params.setdefault("sid", reality_opts.get("short-id") or reality_opts.get("short_id") or "")
-        params.setdefault("fp", item.get("client-fingerprint") or item.get("fingerprint") or "chrome")
+            params["security"] = "reality"
+            params["pbk"] = reality_opts.get("public-key") or reality_opts.get("public_key")
+            params["sid"] = reality_opts.get("short-id") or reality_opts.get("short_id") or ""
+        elif item.get("tls"):
+            params["security"] = "tls"
+        else:
+            params["security"] = str(item.get("security") or "")
+        params.setdefault(
+            "fp", item.get("client-fingerprint") or item.get("fingerprint") or "chrome"
+        )
         params.setdefault("type", item.get("network") or "tcp")
     if typ == "trojan":
         params.setdefault("password", item.get("password"))
         params.setdefault("sni", item.get("sni") or item.get("servername") or "")
+    if typ == "ss":
+        params.setdefault("method", item.get("cipher") or item.get("method"))
+        params.setdefault("password", item.get("password"))
+        params.setdefault("plugin", item.get("plugin") or "")
+        params.setdefault("plugin_opts", _plugin_opts_string(item.get("plugin-opts")))
+    if typ == "hysteria2":
+        params.setdefault("sni", item.get("sni") or item.get("servername") or server)
+        params.setdefault("insecure", bool(item.get("skip-cert-verify", False)))
     return ProxyNodeSpec(
         name=name,
         protocol=typ,
@@ -257,7 +358,8 @@ def _spec_from_clash_proxy(item: dict[str, Any]) -> ProxyNodeSpec | None:
 
 
 def _spec_from_singbox_outbound(item: dict[str, Any]) -> ProxyNodeSpec | None:
-    typ = str(item.get("type", "")).lower()
+    raw_type = str(item.get("type", "")).lower()
+    typ = "ss" if raw_type == "shadowsocks" else raw_type
     if typ not in SUPPORTED_SCHEMES:
         return None
     server = str(item.get("server", ""))

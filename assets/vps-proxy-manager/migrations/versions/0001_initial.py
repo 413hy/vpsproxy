@@ -1,4 +1,5 @@
 """initial schema"""
+
 from __future__ import annotations
 
 import sqlalchemy as sa
@@ -22,7 +23,9 @@ def upgrade() -> None:
         sa.Column("encrypted_link", sa.Text(), nullable=False),
         sa.Column("fingerprint", sa.String(length=64), nullable=False),
         sa.Column("tags", sa.JSON(), nullable=False),
-        sa.Column("status", sa.Enum("unknown", "online", "offline", name="nodestatus"), nullable=False),
+        sa.Column(
+            "status", sa.Enum("unknown", "online", "offline", name="nodestatus"), nullable=False
+        ),
         sa.Column("last_latency_ms", sa.Integer(), nullable=True),
         sa.Column("last_test", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -50,7 +53,9 @@ def upgrade() -> None:
         sa.Column("host", sa.String(length=253), nullable=False),
         sa.Column("port", sa.Integer(), nullable=False),
         sa.Column("username", sa.String(length=64), nullable=False),
-        sa.Column("auth_method", sa.Enum("password", "private_key", name="authmethod"), nullable=False),
+        sa.Column(
+            "auth_method", sa.Enum("password", "private_key", name="authmethod"), nullable=False
+        ),
         sa.Column("encrypted_secret", sa.Text(), nullable=False),
         sa.Column("known_host", sa.Text(), nullable=True),
         sa.Column("system_info", sa.JSON(), nullable=False),
@@ -66,8 +71,37 @@ def upgrade() -> None:
     op.create_table(
         "tasks",
         sa.Column("id", sa.Integer(), primary_key=True),
-        sa.Column("kind", sa.Enum("detect", "status", "test_ssh", "import_subscription", "speedtest", "apply_proxy", "stop_proxy", "restore_proxy", "rollback", "uninstall", name="taskkind"), nullable=False),
-        sa.Column("status", sa.Enum("queued", "running", "cancel_requested", "succeeded", "failed", "rolled_back", "canceled", name="taskstatus"), nullable=False),
+        sa.Column(
+            "kind",
+            sa.Enum(
+                "detect",
+                "status",
+                "test_ssh",
+                "import_subscription",
+                "speedtest",
+                "apply_proxy",
+                "stop_proxy",
+                "restore_proxy",
+                "rollback",
+                "uninstall",
+                name="taskkind",
+            ),
+            nullable=False,
+        ),
+        sa.Column(
+            "status",
+            sa.Enum(
+                "queued",
+                "running",
+                "cancel_requested",
+                "succeeded",
+                "failed",
+                "rolled_back",
+                "canceled",
+                name="taskstatus",
+            ),
+            nullable=False,
+        ),
         sa.Column("host_id", sa.Integer(), sa.ForeignKey("vps_hosts.id"), nullable=True),
         sa.Column("actor_user_id", sa.Integer(), nullable=False),
         sa.Column("payload", sa.JSON(), nullable=False),

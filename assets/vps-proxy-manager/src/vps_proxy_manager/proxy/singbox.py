@@ -41,6 +41,45 @@ def node_to_outbound(node: ProxyNodeSpec, tag: str = "proxy") -> dict[str, Any]:
             "password": node.params.get("password", ""),
             "tls": {"enabled": True, "server_name": node.params.get("sni", node.server)},
         }
+    if node.protocol == "ss":
+        return {
+            "type": "shadowsocks",
+            "tag": tag,
+            "server": node.server,
+            "server_port": node.port,
+            "method": node.params.get("method") or node.params.get("cipher"),
+            "password": node.params.get("password", ""),
+            **(
+                {
+                    "plugin": node.params["plugin"],
+                    "plugin_opts": node.params.get("plugin_opts", ""),
+                }
+                if node.params.get("plugin")
+                else {}
+            ),
+        }
+    if node.protocol == "hysteria2":
+        hysteria2_outbound: dict[str, Any] = {
+            "type": "hysteria2",
+            "tag": tag,
+            "server": node.server,
+            "server_port": node.port,
+            "password": node.params.get("password", ""),
+            "tls": {
+                "enabled": True,
+                "server_name": node.params.get("sni") or node.server,
+                "insecure": bool(node.params.get("insecure", False)),
+            },
+        }
+        if node.params.get("obfs"):
+            hysteria2_outbound["obfs"] = {
+                "type": node.params["obfs"],
+                "password": node.params.get("obfs-password", ""),
+            }
+        for field in ["up_mbps", "down_mbps"]:
+            if node.params.get(field):
+                hysteria2_outbound[field] = int(node.params[field])
+        return hysteria2_outbound
     raise ConfigError(f"protocol not supported by config generator: {node.protocol}")
 
 
@@ -91,7 +130,7 @@ def _vmess_outbound(node: ProxyNodeSpec, tag: str) -> dict[str, Any]:
         "security": security,
         "alter_id": int(params.get("aid") or params.get("alterId") or 0),
     }
-    if params.get("tls") == "tls":
+    if params.get("tls") in {True, "true", "tls"}:
         outbound["tls"] = {"enabled": True, "server_name": params.get("sni") or node.server}
     return outbound
 
@@ -134,18 +173,17 @@ def build_tun_config(
                 "auto_redirect": auto_redirect,
                 "strict_route": True,
                 "stack": "mixed",
-                "sniff": True,
             }
         ],
         "outbounds": [
             node_to_outbound(node, "proxy"),
             {"type": "direct", "tag": "direct"},
-            {"type": "block", "tag": "block"},
-            {"type": "dns", "tag": "dns-out"},
         ],
         "route": {
             "auto_detect_interface": True,
+            "default_domain_resolver": "local-dns",
             "rules": [
+                {"action": "sniff"},
                 {"protocol": "dns", "action": "hijack-dns"},
                 {"ip_cidr": exclude, "outbound": "direct"},
                 {"port": ssh_port, "network": "tcp", "outbound": "direct"},
@@ -159,15 +197,22 @@ def build_tun_config(
 def build_speedtest_config(node: ProxyNodeSpec, listen_port: int) -> dict[str, Any]:
     return {
         "log": {"level": "error"},
+        "dns": {
+            "servers": [{"type": "local", "tag": "local-dns"}],
+            "strategy": "prefer_ipv4",
+        },
         "inbounds": [
             {
                 "type": "mixed",
                 "tag": "mixed-in",
                 "listen": "127.0.0.1",
                 "listen_port": listen_port,
-                "sniff": True,
             }
         ],
         "outbounds": [node_to_outbound(node, "proxy"), {"type": "direct", "tag": "direct"}],
-        "route": {"final": "proxy"},
+        "route": {
+            "default_domain_resolver": "local-dns",
+            "rules": [{"action": "sniff"}],
+            "final": "proxy",
+        },
     }

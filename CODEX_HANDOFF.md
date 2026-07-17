@@ -1,289 +1,163 @@
 # Codex Handoff
 
-这个文件是给接手本仓库的 Codex 或运维自动化 agent 看的。目标是让接手者不需要读完整聊天记录，也能知道项目是什么、在哪里、如何部署、如何验证、哪些地方不能乱改。
+这份文件供接手仓库或控制端 VPS 的另一个 Codex 使用。不要依赖历史聊天；以下内容是当前运行模型。
 
 ## 项目定位
 
-本仓库是一个 Codex Skill，内含一个可部署的 Telegram Bot 后端。它运行在控制端 VPS 上，通过 Telegram 菜单管理用户本人拥有或明确授权的目标 VPS，并在目标 VPS 上安装/配置/管理 `sing-box` 系统级全局代理。
+仓库是一个 Codex Skill，内含可部署的异步 Telegram Bot 后端。它管理用户本人拥有或明确授权的 Debian/Ubuntu VPS，并在目标 VPS 上通过 sing-box TUN 管理系统级主要出站。
 
-不要把它理解成“Codex 临时根据 Telegram 消息生成 shell 命令”。生产路径是：
-
-```text
-Telegram Bot -> 受控任务 -> SSH 客户端 -> 固定远端 payload action -> 目标 VPS
-```
-
-Telegram 输入必须经过校验，不能拼接成任意 shell。
-
-Codex 的职责是介入控制端生命周期：
-
-- 安装 Skill 和可部署项目
-- 生成/检查配置
-- 初始化数据库
-- 启动/重启 systemd 服务
-- 运行测试和 doctor
-- 分析脱敏日志
-- 修复代码和脚本
-- 通过受控 CLI 或 systemd 做维护动作
-
-Codex 不应该成为 Telegram 运行时每个 VPS 操作的必经 LLM 决策节点。目标 VPS 部署由已审核的确定性任务执行，避免 Telegram 输入触发任意命令。
-
-## 关键路径
-
-仓库根：
+生产链路不是“Telegram 文本 -> LLM 生成 Shell”。当前链路为：
 
 ```text
-/root/vpsvpn/vpsproxy-skill-repo
+Telegram Bot
+  ├─ 控制端资源操作 -> 固定 TaskRunner -> 控制端 sing-box 测速
+  ├─ 目标 VPS 操作  -> 固定 TaskRunner -> AsyncSSH -> 远端 Agent 固定 action
+  └─ 新 VPS 准入    -> CodexTask -> Codex Worker -> bootstrap Skill -> 固定 CLI
 ```
 
-Skill 入口：
+Codex 确实介入新 VPS 初始化，但只收到候选 ID 和任务 ID。SSH 凭据由固定 CLI 从加密数据库读取，不能进入提示词或 Codex 输出。
+
+## 不能混合的数据域
+
+- `proxy_nodes`：控制端手工单节点库。只包含单独导入的节点。
+- `subscriptions`：控制端完整订阅对象。
+- `subscription_entries`：订阅的私有解析/测速缓存，不属于单节点库。
+- `vps_nodes`：明确导入到某台 VPS 的单节点副本。
+- `vps_subscriptions`：明确导入到某台 VPS 的完整订阅副本。
+- `vps_subscription_entries`：从该 VPS 拉取订阅后形成的测速缓存。
+- `vps_proxy_states`：每台 VPS 唯一当前出站状态。
+- `vps_candidates` / `codex_tasks`：Codex 准入工作区；验收前不能出现在正式 VPS 列表。
+
+删除控制端节点或订阅时必须先显示 `node_usage` / `subscription_usage`。强制删除任务会逐台停止正在使用的代理、删除远端副本，最后删除控制端源对象。
+
+## 仓库和部署路径
 
 ```text
-SKILL.md
-agents/openai.yaml
+仓库: /root/vpsvpn/vpsproxy-skill-repo
+项目: /root/vpsvpn/vpsproxy-skill-repo/assets/vps-proxy-manager
+部署: /opt/vps-proxy-manager
+环境: /etc/vps-proxy-manager/vps-proxy-manager.env
+数据库: /opt/vps-proxy-manager/data/app.db
+主 Skill: 仓库根 SKILL.md
+准入 Skill: /root/.codex/skills/vps-proxy-target-bootstrap
 ```
 
-可部署项目：
+systemd 服务均按用户要求以 root 运行：
 
 ```text
-assets/vps-proxy-manager
+vps-proxy-manager.service          Telegram Bot + TaskRunner
+vps-proxy-codex-worker.service    Codex 候选 VPS 准入
 ```
 
-控制端安装后路径：
+Bot 服务有 `NoNewPrivileges`、`ProtectSystem=strict` 和受限写目录。Codex Worker 需要访问 `/root/.codex`、数据库、Codex CLI 和目标网络。
 
-```text
-/opt/vps-proxy-manager
-/etc/vps-proxy-manager/vps-proxy-manager.env
-/etc/systemd/system/vps-proxy-manager.service
-```
-
-## 当前部署方式
-
-在控制端 VPS 上：
+## 安装与验证
 
 ```bash
 cd /root/vpsvpn/vpsproxy-skill-repo/assets/vps-proxy-manager
 sudo ./scripts/install.sh
-sudo nano /etc/vps-proxy-manager/vps-proxy-manager.env
+sudo editor /etc/vps-proxy-manager/vps-proxy-manager.env
+sudo codex login status
 sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager init-db
-sudo systemctl enable --now vps-proxy-manager.service
+sudo systemctl enable --now vps-proxy-manager.service vps-proxy-codex-worker.service
 ```
 
-`vps-proxy-manager.service` 当前按用户要求以 root 运行。不要在文档里声称它是低权限用户运行。
+环境文件必须是 `root:root 0600`。不要执行 `cat` 或把值带进回复。只检查变量是否存在：
 
-## 必填环境变量
+```bash
+sudo stat -c '%U:%G %a %n' /etc/vps-proxy-manager/vps-proxy-manager.env
+```
 
-配置文件：
+必填变量：
 
 ```text
-/etc/vps-proxy-manager/vps-proxy-manager.env
+VPSPM_TELEGRAM_BOT_TOKEN
+VPSPM_ADMIN_USER_IDS
+VPSPM_SECRET_KEY
 ```
 
-必填：
+Codex 相关变量默认指向 `/usr/local/bin/codex`、`/root/.codex` 和 `/opt/vps-proxy-manager`。`doctor` 会校验 Fernet 密钥、Codex CLI 和登录状态。
 
-```env
-VPSPM_TELEGRAM_BOT_TOKEN=...
-VPSPM_ADMIN_USER_IDS=6977085303
-VPSPM_SECRET_KEY=...
+## 新 VPS 准入
+
+1. Bot 向导验证名称、主机、端口、用户和认证内容。
+2. `ssh-keyscan` 获取主机公钥并显示 SHA256 指纹，用户确认后固定 known_hosts 内容。
+3. Bot 测试 SSH 与系统信息，创建 `VpsCandidate` 和 `CodexTask`。
+4. Worker 将任务标为 running，然后调用 `codex exec`，提示词只有数字 ID。
+5. Codex 使用 `$vps-proxy-target-bootstrap`，执行固定 `provision-candidate` 命令。
+6. CLI 通过 SSH 安装并持久化远端 Agent、检查 Debian/Ubuntu、TUN 和 sing-box。
+7. 初始化完成后代理保持停止，VPS 使用本地出口。
+8. 新 SSH 会话验证 Agent 版本、sing-box 版本和本地公网访问。
+9. 全部通过后才从候选域提升为正式 `VpsHost`。
+
+Worker 或 Codex 重启后，running 初始化任务会失败并要求 Telegram 手动重试，不自动重放高风险动作。
+
+## 目标 VPS 固定 action
+
+`src/vps_proxy_manager/ssh/client.py` 的 `REMOTE_ACTIONS` 是唯一远端动作名单：
+
+```text
+detect initialize store_node store_subscription remove_node remove_subscription
+fetch_subscription apply_proxy confirm_proxy rollback stop_proxy restore_proxy
+uninstall status speedtest
 ```
 
-生成密钥：
+动作名不能来自 Telegram 自由文本。参数通过 JSON stdin 传给固定 Python Agent，资源文件名只允许正整数 ID。
+
+## 代理切换与回滚
+
+应用配置时：
+
+1. 根据 VPS 资源副本生成 sing-box 配置。
+2. 绕过私网、本地网、控制端 SSH 来源 IP 和代理服务器 IP。
+3. 远端备份配置、systemd 单元、服务 active/enabled 状态、路由/rule/nft/resolver 快照。
+4. 写入 `/etc/vps-proxy-manager/rollback-last.sh` 并启动 `vpspm-rollback.timer`。
+5. `sing-box check` 成功后才替换配置并启动。
+6. 控制端建立新的 SSH 会话，检查服务 active 和真实 HTTPS 204 访问。
+7. 仅在验证成功后调用 `confirm_proxy` 解除定时器并更新数据库当前节点。
+
+回滚必须恢复备份时的服务启用和运行状态。旧配置存在并不代表旧服务原本处于运行状态；不要重新引入“有配置就启动”的错误。
+
+## 出口操作语义
+
+- `stop_proxy`：停止并禁用服务，持久使用 VPS 本地出口；节点、订阅、上次配置保留。
+- `restore_proxy`：保护性恢复上次代理；验证失败时定时回滚到启动前的本地状态。
+- `rollback`：恢复上次切换前的配置和当时出口模式，不等同于强制本地出口。
+- `uninstall`：恢复首次初始化前的 sing-box 配置/单元/服务状态，删除目标 VPS 资源库；保留远端 Agent 和备份。
+- `delete_host`：可以仅删控制端记录，或先卸载再删。
+
+## 测试要求
 
 ```bash
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager keygen
-```
-
-不要打印、提交或写入日志：
-
-- Telegram Bot Token
-- SSH 密码
-- SSH 私钥
-- 订阅链接
-- 完整代理节点链接
-- UUID
-
-## 验证部署
-
-```bash
-sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
-sudo systemctl is-active vps-proxy-manager.service
-sudo systemctl status vps-proxy-manager.service --no-pager
-```
-
-安全检查：
-
-```bash
-rg -n 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY|[0-9]{6,12}:[A-Za-z0-9_-]{20,}' .
-```
-
-开发检查：
-
-```bash
-cd assets/vps-proxy-manager
-python3.11 -m venv .venv
+cd /root/vpsvpn/vpsproxy-skill-repo/assets/vps-proxy-manager
 . .venv/bin/activate
-pip install -e ".[dev]"
-ruff check .
+ruff format --check src tests migrations
+ruff check src tests migrations
 mypy src
-pytest
+pytest -q
 ```
 
-## Telegram 使用流程
+代理解析或生成器改动后，对每种协议运行 `sing-box check`。远端逻辑测试必须 monkeypatch 所有 `/etc`、`/usr/local` 和 systemd 路径；禁止测试触碰宿主机真实配置。
 
-用户侧：
-
-1. `/start`
-2. `添加 VPS`
-3. 输入名称、IP/域名、端口、用户名、密码或私钥
-4. Bot 测试 SSH 并保存 SSH 指纹
-5. `导入单节点` 或 `导入订阅`
-6. `代理节点`
-7. 选择节点，先测速
-8. 选择应用到 VPS
-9. 二次确认高风险操作
-10. 查看 `当前状态`
-
-高风险操作必须保留确认：
-
-- 应用全局代理
-- 切回本地出口
-- 启用代理
-- 回滚
-- 卸载
-- 删除 VPS/凭据
-
-## 代码模块说明
-
-```text
-src/vps_proxy_manager/bot/
-```
-
-Telegram 菜单、向导、callback 路由和管理员鉴权。
-
-```text
-src/vps_proxy_manager/tasks/runner.py
-```
-
-后台任务执行器。对同一 VPS 的网络修改任务加锁。
-
-```text
-src/vps_proxy_manager/ssh/client.py
-```
-
-SSH 连接、主机指纹采集、远端 payload 执行。
-
-```text
-src/vps_proxy_manager/remote/payload.py
-```
-
-目标 VPS 上通过 `python3 - action` 执行的固定动作集合。这里是最敏感区域，改动后必须重新检查回滚逻辑。
-
-```text
-src/vps_proxy_manager/proxy/parser.py
-```
-
-节点和订阅解析。
-
-```text
-src/vps_proxy_manager/proxy/singbox.py
-```
-
-sing-box TUN 配置生成。
-
-```text
-src/vps_proxy_manager/proxy/ssrf.py
-```
-
-订阅下载 SSRF 防护。
-
-```text
-src/vps_proxy_manager/models.py
-```
-
-SQLAlchemy 数据模型。
-
-## 远端代理应用流程
-
-1. 生成 sing-box TUN 配置。
-2. SSH 到目标 VPS。
-3. 备份 `/etc/sing-box/config.json`、路由、防火墙、resolver 状态。
-4. 写入 `/etc/vps-proxy-manager/rollback-last.sh`。
-5. 启动 `vpspm-rollback.timer`。
-6. `sing-box check -c config.json`。
-7. 启动并 enable `sing-box.service`。
-8. 控制端确认 SSH/status 仍可用。
-9. 关闭 rollback timer。
-
-不要移除自动回滚保护。
-
-## 本地出口恢复逻辑
-
-用户说“还原/恢复成本地出口/不用代理模式”时，应该使用 Telegram 的 `切回本地出口`，对应远端 action 是 `stop_proxy`。
-
-当前语义：
-
-```text
-stop_proxy    = systemctl disable --now sing-box.service
-restore_proxy = systemctl enable --now sing-box.service
-```
-
-也就是说：
-
-- `stop_proxy` 是持久本地出口，重启后仍不走代理。
-- `restore_proxy` 是重新启用已有代理配置。
-- `rollback` 是回到上一次备份配置，不等同于普通本地出口。
-- `uninstall` 是停用 sing-box 并删除托管配置。
-
-## 常见故障点
-
-Bot 不启动：
-
-- 检查 env 文件是否存在。
-- 检查 Token 和 admin ID。
-- `journalctl -u vps-proxy-manager.service -n 100 --no-pager`
-
-Telegram API 能通但无菜单：
-
-- 用户 ID 不在 `VPSPM_ADMIN_USER_IDS`。
-- 如果 `VPSPM_REQUIRE_PRIVATE_CHAT=true`，必须私聊 Bot。
-
-SSH 失败：
-
-- 密码/私钥错误。
-- SSH 主机指纹变化。
-- 目标用户没有 sudo 权限。
-
-应用代理后目标异常：
-
-- Telegram 里执行回滚。
-- 如果 SSH 失联，用云厂商 VNC 执行 `/etc/vps-proxy-manager/rollback-last.sh`。
-
-## 不要做的事
-
-- 不要把真实 `/etc/vps-proxy-manager/vps-proxy-manager.env` 复制进仓库。
-- 不要在日志里打印 token、密码、私钥、完整节点链接。
-- 不要把 Telegram 输入拼接进 shell。
-- 不要强推覆盖 GitHub 远端，除非用户明确要求。
-- 不要移除 SSH 指纹校验。
-- 不要移除高风险操作二次确认。
-- 不要移除目标 VPS 自动回滚定时器。
-
-## 推送仓库
-
-当前远端：
+发布前执行敏感扫描，管理员 ID 也不要写死进公开文档：
 
 ```bash
-git remote -v
+rg -n --hidden --glob '!.git/**' --glob '!.venv/**' \
+  'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY|[0-9]{6,12}:[A-Za-z0-9_-]{20,}|VPSPM_TELEGRAM_BOT_TOKEN=.+|VPSPM_SECRET_KEY=.+[A-Za-z0-9_-]{30,}' .
 ```
 
-如果机器上已有 `~/.ssh/codex_tg_manager` 且能认证 GitHub：
+## 升级、备份、恢复
+
+升级脚本会先停两个服务、创建带时间戳的 `app.db.before-upgrade.*`、在同步时排除 data/venv/env、安装依赖、更新准入 Skill、执行 Alembic，再启动服务：
 
 ```bash
-GIT_SSH_COMMAND='ssh -i ~/.ssh/codex_tg_manager -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' git push
+sudo ./scripts/upgrade.sh
 ```
 
-推送前必须先跑敏感扫描：
+正式备份必须同时包含数据库目录和环境文件。恢复时保持原 `VPSPM_SECRET_KEY`，执行 `init-db` 后再启动服务。
 
-```bash
-rg -n 'BEGIN (OPENSSH|RSA|EC) PRIVATE KEY|[0-9]{6,12}:[A-Za-z0-9_-]{20,}|VPSPM_TELEGRAM_BOT_TOKEN=.*[A-Za-z0-9_-]{20,}' .
-```
+目标失联时首先使用云厂商控制台运行 `/etc/vps-proxy-manager/rollback-last.sh`。脚本不存在时运行仓库 `scripts/emergency_restore.sh`；它只停 sing-box 并保留未知配置。
+
+## GitHub
+
+远端仓库：`https://github.com/413hy/vpsproxy-skill`。推送前检查 `git status`、完整测试和敏感扫描。不要覆盖用户未提交的更改，不要强推。

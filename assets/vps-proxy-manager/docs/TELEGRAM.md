@@ -1,46 +1,107 @@
-# Telegram Operation
+# Telegram Bot 操作说明
 
-## Main Menu
+## 导航约定
 
-- VPS 管理
-- 添加 VPS
-- 代理节点
-- 导入单节点
-- 导入订阅
-- 节点测速
-- 切换节点
-- 当前状态
-- 任务记录
-- 安全设置
-- 帮助
+底部 Reply Keyboard 是持久主菜单：
 
-## Add VPS Wizard
+```text
+VPS 管理        单节点库
+订阅库          任务中心
+控制端状态      系统设置
+```
 
-1. VPS name.
-2. IP or domain.
-3. SSH port.
-4. SSH username.
-5. Auth method: password or SSH private key.
-6. Bot tests SSH and detects OS.
-7. Host key and encrypted credential are saved.
+列表、分页、选择、确认、返回和取消使用 Inline Keyboard。页面跳转优先编辑原消息，避免聊天被状态消息刷屏。长任务定期编辑同一条任务消息。Callback Query 会先应答，再执行数据库或后台任务。
 
-## Node Import
+基础命令：`/start`、`/menu`、`/help`、`/cancel`。主要操作无需记忆命令。
 
-Single-node import validates the link and shows a masked server. Subscription import fetches from the control VPS, parses plain link lists, base64 subscriptions, Clash YAML, and sing-box JSON, then saves nodes without switching automatically.
+## 添加 VPS
 
-## Node Pages
+1. `VPS 管理` -> `添加 VPS`。
+2. 输入唯一名称或备注。
+3. 输入 IP 或域名。
+4. 输入 SSH 端口。
+5. 输入 SSH 用户名。
+6. 选择 `密码` 或 `SSH 私钥`。
+7. 输入认证内容；Bot 读取后尽量删除消息。
+8. Bot 获取 SSH 主机公钥，展示 SHA256 指纹，并检测 OS、架构、TUN、路由和控制端 SSH 来源地址。
+9. 核对后确认保存。
+10. VPS 进入“待初始化”，Codex Worker 安装和验收远端组件。
+11. 只有任务成功后，VPS 才出现在正式列表，初始为本地出口。
 
-Each page shows node name, protocol, status, latency, and current-node marker. Node detail provides:
+初始化失败不会自动反复重试。进入 `待初始化` 查看简化错误，修复权限、网络或 TUN 后点击 `重新交给 Codex 初始化`。
 
-- select and apply to VPS
-- test from VPS
-- back
+## 单节点库
 
-## High Risk Confirmation
+`单节点库` 只管理单独粘贴的链接：
 
-The bot asks for confirmation before apply, switching back to local exit, re-enabling proxy, rollback, uninstall, or host credential deletion.
+- `导入单节点`：解析、校验并保存，订阅条目不会出现在这里。
+- `全部本地测速`：从控制端受限并发测试所有单节点。
+- 节点详情：控制端测速、导入指定 VPS、完整导出、删除。
 
-## Exit Modes
+测速显示状态和真实访问延迟；详情分开展示 TCP、代理握手和真实 HTTPS 延迟。
 
-- `切回本地出口`: persistent direct VPS egress. It disables and stops sing-box.
-- `启用代理`: starts and enables sing-box again with the existing managed config.
+导入指定 VPS 使用多选 Inline Keyboard。确认后每台 VPS 各自创建副本，并通过远端 Agent 存入目标资源库，不会自动设为出口。
+
+## 订阅库
+
+`订阅库` 管理完整订阅对象：
+
+- 输入订阅名称和 HTTPS URL。
+- 控制端安全拉取并缓存订阅内容。
+- `查看订阅节点` 分页查看缓存条目，并可按名称搜索、可用状态筛选和名称/延迟排序。
+- `本地测速全部` 使用当前缓存。
+- `更新并测速` 重新拉取并更新缓存，然后测速；不会自动切换 VPS。
+- `导入指定 VPS` 把完整订阅 URL 复制到选定 VPS。
+- `完整导出` 导出名称、URL 和当前完整内容。
+
+订阅缓存条目只属于该订阅，不会被写入单节点库。
+
+## VPS 资源
+
+进入一台正式 VPS：
+
+- `单节点`：该 VPS 已导入的单节点副本。
+- `订阅`：该 VPS 已导入的完整订阅副本。
+- `导入资源`：从控制端两类库选择资源。
+- `刷新状态`：建立 SSH 并读取 Agent、sing-box、出口和备份状态。
+- `编辑连接`：重做主机地址、端口、用户、认证和主机指纹验证。
+
+VPS 单节点页可以测试全部或单个。VPS 订阅页点击 `从此 VPS 测试全部` 后，目标 VPS 自己拉取订阅，随后所有节点连接和真实访问均从该 VPS 发起。
+
+选择节点/订阅条目后，点击 `设为当前出口` 并二次确认。一个 VPS 任一时刻只记录一个当前代理出站。
+
+## 本地出口、恢复与卸载
+
+- `切回本地出口`：停止并禁用 sing-box；节点、订阅和上次配置保留。
+- `启用上次代理`：仅在有上次选择时显示；设置自动回滚后恢复并验证。
+- `回滚配置`：恢复上次切换前配置及其当时出口模式。
+- `卸载代理`：恢复首次初始化前的 sing-box 状态，并删除该 VPS 的托管资源库。
+- `删除 VPS`：选择“仅移除管理记录”或“卸载代理后移除”。
+
+切回本地出口和卸载不是同一操作；删除控制端记录也不会隐式修改远端，除非选择卸载后移除。
+
+## 删除控制端资源
+
+删除单节点或订阅时，Bot 先显示正在使用它的 VPS 名称：
+
+- 无使用者时仍需确认。
+- 有使用者时，`强制删除所有副本` 会逐台处理。
+- 若某 VPS 正使用该资源，先切回本地出口，再删目标副本。
+- 任一远端删除失败时任务失败，保留尚未处理的数据供手工重试。
+
+## 任务中心
+
+普通任务显示任务号、类型、状态和进度。测速任务支持请求取消；取消在当前远端子测试结束后生效。Codex 任务单独标记，展示候选初始化进度。
+
+控制端重启后，高风险任务不会自动重放。任务中心会显示“控制端重启，请手工确认后重试”。
+
+## 错误提示
+
+Telegram 只显示可理解的错误类别，例如 SSH 认证失败、主机指纹不匹配、TUN 不可用、订阅被 SSRF 规则拒绝、sing-box 校验失败或公网验证失败。原始堆栈不发送到 Telegram；脱敏技术信息进入 systemd 日志。
+
+## 官方交互依据
+
+Bot 菜单采用 Telegram 官方支持的 Reply Keyboard、Inline Keyboard、Callback Query、消息编辑和命令菜单模式：
+
+- https://core.telegram.org/bots/features
+- https://core.telegram.org/bots/api

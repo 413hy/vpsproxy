@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     subscription_max_redirects: int = 3
     speedtest_concurrency: int = 3
     remote_rollback_seconds: int = 120
+    codex_enabled: bool = True
+    codex_cli: str = "codex"
+    codex_home: Path = Path("/root/.codex")
+    codex_work_dir: Path = Path("/opt/vps-proxy-manager")
+    codex_poll_seconds: int = 3
+    codex_timeout_seconds: int = 900
 
     @field_validator("admin_user_ids", "allowed_chat_ids", mode="before")
     @classmethod

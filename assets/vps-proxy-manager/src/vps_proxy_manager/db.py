@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -14,7 +15,18 @@ from vps_proxy_manager.models import Base
 
 
 def create_engine(database_url: str) -> AsyncEngine:
-    return create_async_engine(database_url, future=True)
+    connect_args = {"timeout": 30} if database_url.startswith("sqlite") else {}
+    engine = create_async_engine(database_url, future=True, connect_args=connect_args)
+    if database_url.startswith("sqlite"):
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _sqlite_pragmas(dbapi_connection: object, _: object) -> None:
+            cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
+    return engine
 
 
 def create_sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

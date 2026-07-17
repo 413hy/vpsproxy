@@ -18,7 +18,9 @@ SECRET_KEYS = {
 }
 
 URL_CREDENTIAL_RE = re.compile(r"(vless|vmess|trojan|ss|hysteria2)://[^ \n\r\t]+", re.I)
-UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I)
+UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", re.I
+)
 TOKEN_RE = re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b")
 
 

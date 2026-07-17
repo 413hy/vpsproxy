@@ -1,87 +1,94 @@
 ---
 name: vps-proxy-telegram
-description: Install, configure, operate, diagnose, and maintain a Telegram-controlled VPS proxy manager for authorized VPS hosts using sing-box TUN, SSH automation, rollback protection, secure subscription parsing, and audited deterministic tasks.
+description: Deploy, configure, test, upgrade, diagnose, and safely operate the bundled Telegram VPS Proxy Manager. Use when Codex must manage the control VPS lifecycle, inspect deterministic proxy tasks, or supervise authorized target-VPS admission through the bundled Codex worker and bootstrap skill.
 ---
 
 # VPS Proxy Telegram
 
-Use this skill when the user wants Codex to install, configure, update, diagnose, or operate the bundled VPS Proxy Manager on a control VPS.
+Operate the project bundled under `assets/vps-proxy-manager/`. Read `CODEX_HANDOFF.md` before changing runtime behavior and read the relevant document under `assets/vps-proxy-manager/docs/` before recovery or upgrade work.
 
-The deployable project is bundled at `assets/vps-proxy-manager/`.
+## Non-Negotiable Boundaries
 
-Codex operates the control-plane lifecycle. Runtime Telegram actions must stay deterministic and must not call Codex to generate arbitrary shell from Telegram input.
+- Act only on VPS hosts owned by the user or explicitly authorized by the user.
+- Never turn Telegram text into generated shell commands.
+- Use only project CLI commands, fixed Python task handlers, the SSH action allowlist, and the installed `$vps-proxy-target-bootstrap` Skill.
+- Never print or commit Bot tokens, SSH credentials, private keys, encryption keys, full node links, or subscription URLs.
+- Keep SSH host-key verification, per-host mutation locking, high-risk confirmations, and target rollback timers enabled.
+- Treat `切回本地出口` as persistent `stop_proxy`; it is separate from rollback, uninstall, and deleting the VPS record.
 
-## Operating Rules
+## Runtime Domains
 
-- Manage only VPS hosts owned by the user or explicitly authorized by the user.
-- Never paste, log, commit, or echo Telegram bot tokens, SSH passwords, private keys, subscription URLs, UUIDs, or full proxy links.
-- Do not generate ad hoc remote shell from Telegram input. Use only the project CLI, fixed Python functions, and audited remote payload commands.
-- For high-risk operations such as applying global proxy routing, rollback, uninstall, credential deletion, and host deletion, require an explicit confirmation in Telegram or from the operator.
-- Treat "restore local exit", "disable proxy", or "不用代理模式" as `stop_proxy`: disable and stop sing-box so the target VPS keeps local egress after reboot.
-- Prefer SSH keys over passwords. If a password is used, explain that it is encrypted at rest but Telegram is not a high-security password vault.
-- For target VPS hosts, prefer Debian/Ubuntu first. Other distros require an adapter extension.
+Do not merge these stores:
 
-## Common Tasks
+1. Controller single-node library: manually imported links only; tests run from the controller.
+2. Controller subscription library: whole subscriptions plus private cached entries; entries never become controller single nodes.
+3. Target VPS libraries: copies explicitly imported to that VPS; target tests run through that VPS.
+4. Target proxy state: one active outbound at most, or persistent local-exit mode.
 
-### Install on the control VPS
+## Codex Admission Workflow
 
-1. Copy or keep this skill folder under the Codex skills directory.
-2. Go to `assets/vps-proxy-manager/`.
-3. Copy `.env.example` to `.env` and fill:
-   - `VPSPM_TELEGRAM_BOT_TOKEN`
-   - `VPSPM_ADMIN_USER_IDS`
-   - `VPSPM_SECRET_KEY` from `python -m vps_proxy_manager keygen`
-4. Run `sudo ./scripts/install.sh`.
-5. Start the bot with `sudo systemctl enable --now vps-proxy-manager.service`.
-
-### Operate
-
-Use the project CLI for deterministic operations:
+The Telegram add-VPS wizard creates `VpsCandidate` and `CodexTask` records after SSH host-key confirmation. `vps-proxy-codex-worker.service` invokes Codex non-interactively with numeric IDs only. Codex must use `$vps-proxy-target-bootstrap`, which runs exactly:
 
 ```bash
-vps-proxy-manager --help
-vps-proxy-manager keygen
-vps-proxy-manager init-db
-vps-proxy-manager run-bot
-vps-proxy-manager doctor
+/opt/vps-proxy-manager/venv/bin/vps-proxy-manager provision-candidate \
+  --candidate-id <integer> \
+  --codex-task-id <integer>
 ```
 
-### Diagnose
+Do not inspect credentials or improvise remote commands. A candidate enters `vps_hosts` only after the deterministic command verifies the Agent version, sing-box installation, stopped proxy state, TUN initialization, local public connectivity, and a pinned SSH host key.
 
-- Read `docs/TROUBLESHOOTING.md` for common Telegram, SSH, subscription, sing-box, DNS, and TUN issues.
-- Use `vps-proxy-manager doctor` for local checks.
-- Use Telegram "当前状态" and "任务记录" for audited host-level status.
-- If a target loses networking, use the target-side script documented in `docs/RECOVERY.md`.
+## Control VPS Lifecycle
 
-## Architecture Pointers
+Install:
 
-- Bot UI: `src/vps_proxy_manager/bot/`
-- Task queue and locks: `src/vps_proxy_manager/tasks/`
-- SSH transport: `src/vps_proxy_manager/ssh/`
-- Remote deterministic payload: `src/vps_proxy_manager/remote/payload.py`
-- Node/subscription parsing: `src/vps_proxy_manager/proxy/parser.py`
-- sing-box config generation: `src/vps_proxy_manager/proxy/singbox.py`
-- SSRF protection: `src/vps_proxy_manager/proxy/ssrf.py`
-- Tests: `tests/`
+```bash
+cd assets/vps-proxy-manager
+sudo ./scripts/install.sh
+sudo editor /etc/vps-proxy-manager/vps-proxy-manager.env
+sudo codex login status
+sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
+sudo systemctl enable --now vps-proxy-manager.service vps-proxy-codex-worker.service
+```
 
-## Design Defaults
+Upgrade:
 
-- Python 3.11+
-- `python-telegram-bot` 22.x asynchronous API
-- SQLite + SQLAlchemy async + Alembic migrations
-- `asyncssh` for SSH and SFTP
-- Fernet encryption for stored credentials
-- sing-box TUN inbound with `auto_route`, Linux `auto_redirect` when available, DNS hijack, private/management/proxy-server bypass rules, and rollback timer
+```bash
+cd assets/vps-proxy-manager
+sudo ./scripts/upgrade.sh
+```
 
-## Validation
+Diagnose:
+
+```bash
+sudo /opt/vps-proxy-manager/venv/bin/vps-proxy-manager doctor
+sudo systemctl status vps-proxy-manager.service vps-proxy-codex-worker.service --no-pager
+sudo journalctl -u vps-proxy-manager.service -u vps-proxy-codex-worker.service -n 200 --no-pager
+```
+
+Do not echo the environment file. Report only whether required values are present and permissions are `0600`.
+
+## Change Validation
 
 Run from `assets/vps-proxy-manager/`:
 
 ```bash
-python -m pip install -e ".[dev]"
-ruff check .
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[dev]'
+ruff format --check src tests migrations
+ruff check src tests migrations
 mypy src
-pytest
+pytest -q
 ```
 
-The tests cover VLESS Reality parsing, subscription decoding, SSRF blocking, command-injection guardrails, sing-box config generation, task lock behavior, and rollback command construction.
+For proxy generator changes, also run generated configs through `sing-box check`. For migrations, test both a fresh database and an upgrade from revision `0001_initial`. For rollback changes, verify that a previously stopped service remains stopped after rollback and an active previous service is restored active.
+
+## Recovery
+
+If target SSH still works, use the confirmed Telegram rollback or local-exit action. If SSH is lost, direct the operator to the cloud console and run:
+
+```bash
+sudo /etc/vps-proxy-manager/rollback-last.sh
+```
+
+If absent, use `assets/vps-proxy-manager/scripts/emergency_restore.sh` on the target. Do not delete unknown network or sing-box configuration as an unverified recovery step.

@@ -6,6 +6,7 @@ import socket
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from aiohttp.abc import ResolveResult
 
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
@@ -28,11 +29,44 @@ class SSRFError(ValueError):
 
 
 def _is_blocked_ip(ip: ipaddress._BaseAddress, allow_private: bool) -> bool:  # noqa: SLF001
-    if ip in METADATA_IPS:
+    if (
+        ip in METADATA_IPS
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip.is_multicast
+        or ip.is_reserved
+    ):
         return True
     if allow_private:
-        return False
-    return any(ip in network for network in BLOCKED_NETWORKS)
+        return not (ip.is_global or ip.is_private)
+    return not ip.is_global or any(ip in network for network in BLOCKED_NETWORKS)
+
+
+class PinnedResolver(aiohttp.abc.AbstractResolver):
+    def __init__(self, hostname: str, addresses: list[str]) -> None:
+        self.hostname = hostname
+        self.addresses = addresses
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_UNSPEC
+    ) -> list[ResolveResult]:
+        if host != self.hostname:
+            raise OSError("resolver hostname changed")
+        return [
+            ResolveResult(
+                hostname=host,
+                host=address,
+                port=port,
+                family=socket.AF_INET6 if ":" in address else socket.AF_INET,
+                proto=0,
+                flags=0,
+            )
+            for address in self.addresses
+        ]
+
+    async def close(self) -> None:
+        return None
 
 
 async def resolve_public_host(host: str, allow_private: bool) -> list[str]:
@@ -65,9 +99,14 @@ async def fetch_subscription(
             raise SSRFError("subscription URL must be https")
         if parsed.username or parsed.password:
             raise SSRFError("subscription URL must not include credentials")
-        await resolve_public_host(parsed.hostname, allow_private)
+        addresses = await resolve_public_host(parsed.hostname, allow_private)
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(
+            resolver=PinnedResolver(parsed.hostname, addresses), use_dns_cache=False
+        )
+        async with aiohttp.ClientSession(
+            timeout=timeout, connector=connector, trust_env=False
+        ) as session:
             async with session.get(current, allow_redirects=False) as resp:
                 if 300 <= resp.status < 400 and resp.headers.get("Location"):
                     current = urljoin(current, resp.headers["Location"])

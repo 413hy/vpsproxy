@@ -80,3 +80,68 @@ def test_parse_trojan_link_password() -> None:
     assert node.protocol == "trojan"
     assert node.params["password"] == "secret"  # noqa: S105
     assert node.params["sni"] == "example.com"
+
+
+def test_parse_sip002_shadowsocks_link() -> None:
+    credentials = base64.urlsafe_b64encode(b"aes-256-gcm:test-password").decode().rstrip("=")
+    node = parse_node_link(f"ss://{credentials}@example.com:8388#ss-node")
+    assert node.protocol == "ss"
+    assert node.server == "example.com"
+    assert node.port == 8388
+    assert node.params["method"] == "aes-256-gcm"
+    assert node.params["password"] == "test-password"  # noqa: S105
+
+
+def test_parse_hysteria2_link() -> None:
+    node = parse_node_link(
+        "hysteria2://test-password@example.com:443?sni=cdn.example.com&insecure=1#hy2"
+    )
+    assert node.protocol == "hysteria2"
+    assert node.params["password"] == "test-password"  # noqa: S105
+    assert node.params["sni"] == "cdn.example.com"
+    assert node.params["insecure"] is True
+
+
+def test_parse_hy2_alias() -> None:
+    node = parse_node_link("hy2://test-password@example.com:443?sni=cdn.example.com#alias")
+    assert node.protocol == "hysteria2"
+    assert node.name == "alias"
+
+
+def test_clash_vless_reality_overrides_network_security() -> None:
+    text = """
+proxies:
+  - name: reality
+    type: vless
+    server: example.com
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    network: tcp
+    servername: apple.com
+    reality-opts:
+      public-key: public-key
+      short-id: abcdef
+"""
+    node = parse_subscription_text(text)[0]
+    assert node.params["security"] == "reality"
+    assert node.params["pbk"] == "public-key"
+
+
+def test_clash_shadowsocks_plugin_options_are_normalized() -> None:
+    node = parse_subscription_text(
+        """
+proxies:
+  - name: ss-plugin
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: test-password
+    plugin: v2ray-plugin
+    plugin-opts:
+      mode: websocket
+      tls: true
+      host: cdn.example.com
+"""
+    )[0]
+    assert node.params["plugin_opts"] == "mode=websocket;tls;host=cdn.example.com"

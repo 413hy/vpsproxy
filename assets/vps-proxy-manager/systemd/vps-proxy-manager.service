@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
 WorkingDirectory=/opt/vps-proxy-manager
 EnvironmentFile=/etc/vps-proxy-manager/vps-proxy-manager.env
 ExecStart=/opt/vps-proxy-manager/venv/bin/vps-proxy-manager run-bot
@@ -15,6 +16,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/vps-proxy-manager/data /etc/vps-proxy-manager
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
